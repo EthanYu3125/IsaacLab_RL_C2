@@ -52,6 +52,45 @@ class RewardsCfg:
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
     feet_air_time_max = 0.4  # [s], single-stance time rewarded per step
     feet_contact_force_threshold = 1.0  # [N], a foot pushing harder than this counts as touching the ground
+
+    # Stage 1 weights are selected by env.stage1 (True by default).
+    # Keep the original scalar weights above intact for stage1=False.
+    stage1_weights: dict[str, float] = {
+        "termination": -200.0,
+        "track_lin_vel_xy_exp": 3.0,
+        "track_ang_vel_z_exp": 0.5,
+        "heading_error_l2": -2.0,
+        "lateral_drift_l2": -0.5,
+        "lateral_velocity_l2": -0.5,
+        "idle": -0.25,
+        "flat_orientation_l2": -2.0,
+        "lin_vel_z_l2": -0.5,
+        "ang_vel_xy_l2": -0.1,
+        "base_height_l2": -0.5,
+        "feet_air_time": 0.25,
+        "feet_alternation": 5.0,
+        "no_ground_contact": -1.0,
+        "feet_slide": -0.5,
+        "action_rate_l2": -0.01,
+        "dof_torques_l2": -1.5e-7,
+        "dof_acc_l2": -1.25e-7,
+        "dof_pos_limits": -1.0,
+        "joint_deviation_hip": -0.05,
+        "joint_deviation_arms": -0.05,
+        "joint_deviation_fingers": -0.05,
+        "joint_deviation_torso": -0.1,
+    }
+    stage1_tracking_std = 0.35  # [m/s]
+    stage1_yaw_tracking_std = 0.5  # [rad/s]
+    stage1_lateral_scale = 0.3  # [m]
+    stage1_lateral_penalty_max = 4.0
+    stage1_idle_speed = 0.2  # [m/s]
+    stage1_height_deadband = 0.03  # [m]
+    stage1_height_scale = 0.1  # [m]
+    stage1_swing_time = 0.25  # [s]
+    stage1_swing_time_std = 0.15  # [s]
+    stage1_min_air_time = 0.12  # [s], reject contact chatter
+    stage1_max_air_time = 0.60  # [s], reject prolonged one-legged balancing
     # ==================== TODO: END ====================
 
 
@@ -111,7 +150,7 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     feet_vel = data.body_lin_vel_w.torch[:, env._feet_body_ids, :2]
     feet_slide = torch.sum(feet_vel.norm(dim=-1) * feet_contact, dim=1)
 
-    return {
+    rewards = {
         "termination": env.reset_terminated.float(),
         "track_lin_vel_xy_exp": torch.exp(-lin_vel_error / cfg.tracking_std**2),
         "track_ang_vel_z_exp": torch.exp(-yaw_rate_error / cfg.tracking_std**2),
@@ -128,4 +167,43 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         "feet_air_time": feet_air_time,
         "feet_slide": feet_slide,
     }
+
+    if env.cfg.stage1:
+        # Geometry is relative to the actual reset pose, not the terrain origin.
+        heading = env._target_heading
+        heading_error = torch.remainder(heading - data.heading_w.torch + torch.pi, 2.0 * torch.pi) - torch.pi
+        offset = data.root_pos_w.torch[:, :2] - env._stage1_start_pos[:, :2]
+        lateral_offset = -torch.sin(heading) * offset[:, 0] + torch.cos(heading) * offset[:, 1]
+        height = data.root_pos_w.torch[:, 2] - env._terrain.env_origins[:, 2]
+
+        # Only tracking remains positive at rest; auxiliary bonuses require actual forward motion.
+        upright = (-data.projected_gravity_b.torch[:, 2]).clamp(0.0, 1.0).square()
+        upright = upright * (~env.reset_terminated).float()
+        forward = (vel_yaw[:, 0] / env.cfg.stage1_lin_vel_x).clamp(0.0, 1.0)
+        gait_gate = upright * forward
+        swing_time = torch.where(~in_contact, air_time, 0.0).sum(dim=1)
+        swing_reward = torch.exp(-((swing_time - cfg.stage1_swing_time) / cfg.stage1_swing_time_std).square())
+        height_error = (height - env._stage1_target_height).abs().sub(cfg.stage1_height_deadband).clamp_min(0.0)
+
+        rewards.update(
+            {
+                "track_lin_vel_xy_exp": torch.exp(-lin_vel_error / cfg.stage1_tracking_std**2) * upright,
+                "track_ang_vel_z_exp": torch.exp(-yaw_rate_error / cfg.stage1_yaw_tracking_std**2) * gait_gate,
+                "heading_error_l2": (heading_error / torch.pi).square(),
+                "lateral_drift_l2": (lateral_offset / cfg.stage1_lateral_scale)
+                .square()
+                .clamp(max=cfg.stage1_lateral_penalty_max),
+                "lateral_velocity_l2": vel_yaw[:, 1].square(),
+                "idle": ((cfg.stage1_idle_speed - vel_yaw[:, 0]) / cfg.stage1_idle_speed).clamp(0.0, 1.0).square(),
+                "flat_orientation_l2": flat_orientation + data.projected_gravity_b.torch[:, 2].clamp_min(0.0).square(),
+                "lin_vel_z_l2": data.root_lin_vel_w.torch[:, 2].square(),
+                "base_height_l2": (height_error / cfg.stage1_height_scale).square(),
+                "feet_air_time": swing_reward * single_stance * gait_gate,
+                "feet_alternation": env._stage1_alternating_touchdown.float() * gait_gate,
+                "no_ground_contact": (~in_contact.any(dim=1)).float(),
+                # Contact timers use the current sensor state and the configured force threshold.
+                "feet_slide": (feet_vel.square().sum(dim=-1) * in_contact).sum(dim=1),
+            }
+        )
+    return rewards
     # ==================== TODO: END ====================

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -144,6 +146,15 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     play_lin_vel_x = 1.0  # [m/s], fixed forward command in play mode
     is_play = False
 
+    # Stage 1 commands are identical during training and play.
+    stage1 = True
+    stage1_lin_vel_x = 0.5  # [m/s]
+    stage1_heading_control_stiffness = 1.0
+    stage1_max_yaw_rate = 0.5  # [rad/s], corrective turns only
+    stage1_max_tilt_deg = 60.0
+    stage1_min_height_ratio = 0.55
+    stage1_metrics_warmup_s = 2.0  # exclude startup from steady-walking metrics
+
     # reset: random root pose offset around the env origin
     reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)}
 
@@ -166,6 +177,51 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         self.is_play = True
         self.terrain_curriculum = False
         self.scene.terrain.max_init_terrain_level = None
-        self.scene.terrain.terrain_generator.num_rows = 5
-        self.scene.terrain.terrain_generator.num_cols = 5
-        self.scene.terrain.terrain_generator.curriculum = False
+        if not self.stage1 and self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.num_rows = 5
+            self.scene.terrain.terrain_generator.num_cols = 5
+            self.scene.terrain.terrain_generator.curriculum = False
+
+    def configure_stage1(self) -> None:
+        """Apply the mode after CLI overrides, immediately before constructing the scene.
+
+        Keep __post_init__ mode-neutral so a late ``env.stage1=False`` override
+        retains the original generator and curriculum. Mode changes require a new environment.
+        """
+        if not self.stage1:
+            return
+        positive = {
+            "stage1_lin_vel_x": self.stage1_lin_vel_x,
+            "stage1_max_yaw_rate": self.stage1_max_yaw_rate,
+            "scene.env_spacing": self.scene.env_spacing,
+            **{
+                name: getattr(self.rewards, name)
+                for name in (
+                    "stage1_tracking_std",
+                    "stage1_yaw_tracking_std",
+                    "stage1_lateral_scale",
+                    "stage1_idle_speed",
+                    "stage1_height_scale",
+                    "stage1_swing_time_std",
+                )
+            },
+        }
+        for name, value in positive.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive, got {value}")
+        if not 0.0 < self.stage1_min_height_ratio < 1.0:
+            raise ValueError("stage1_min_height_ratio must be between 0 and 1")
+        if not 0.0 < self.stage1_max_tilt_deg < 180.0:
+            raise ValueError("stage1_max_tilt_deg must be between 0 and 180 degrees")
+        if not 0.0 < self.rewards.stage1_min_air_time < self.rewards.stage1_max_air_time:
+            raise ValueError("Stage 1 air-time bounds must satisfy 0 < min < max")
+
+        self.scene.terrain = replace(
+            self.scene.terrain,
+            terrain_type="plane",
+            terrain_generator=None,
+            max_init_terrain_level=None,
+            env_spacing=self.scene.env_spacing,
+        )
+        self.scene.contact_forces.force_threshold = self.rewards.feet_contact_force_threshold
+        self.terrain_curriculum = False

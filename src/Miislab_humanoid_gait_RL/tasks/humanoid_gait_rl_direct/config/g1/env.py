@@ -28,6 +28,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
     cfg: HumanoidGaitRlEnvCfg
 
     def __init__(self, cfg: HumanoidGaitRlEnvCfg, render_mode: str | None = None, **kwargs):
+        cfg.configure_stage1()
         super().__init__(cfg, render_mode, **kwargs)
 
         self._robot, self._contact_sensor, self._height_scanner, self._terrain = [
@@ -71,7 +72,37 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._error_vel_xy_sum = torch.zeros(self.num_envs, device=self.device)
         self._error_vel_yaw_sum = torch.zeros(self.num_envs, device=self.device)
 
+        if self.cfg.stage1:
+            self._init_stage1_buffers()
+
+    def _init_stage1_buffers(self) -> None:
+        """Allocate per-environment state; these buffers never enter the policy observation."""
+        self._stage1_start_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self._stage1_target_height = self._robot.data.default_root_pose.torch[:, 2].clone()
+        self._stage1_last_touchdown = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._stage1_alternating_touchdown = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._stage1_episode_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._stage1_steady_steps = torch.zeros_like(self._stage1_episode_steps)
+        self._stage1_alternating_steps = torch.zeros(self.num_envs, device=self.device)
+        self._stage1_metric_sums = {
+            key: torch.zeros(self.num_envs, device=self.device)
+            for key in ("forward_speed", "lateral_deviation", "heading_error", "foot_slide_speed")
+        }
+        self._stage1_steady_metric_sums = {
+            key: torch.zeros_like(value) for key, value in self._stage1_metric_sums.items()
+        }
+        self._stage1_termination_causes = {
+            key: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for key in ("torso_contact", "excessive_tilt", "low_height")
+        }
+
     def _resample_commands(self, env_ids: torch.Tensor):
+        if self.cfg.stage1:
+            # The target heading was captured from the reset pose and stays fixed for the episode.
+            self._commands[env_ids, 0] = self.cfg.stage1_lin_vel_x
+            self._commands[env_ids, 1] = 0.0
+            self._commands[env_ids, 2] = 0.0
+            return
         num = len(env_ids)
         if self.cfg.is_play:
             self._commands[env_ids, 0] = self.cfg.play_lin_vel_x
@@ -84,17 +115,20 @@ class HumanoidGaitRlEnv(DirectRLEnv):
 
     def _update_yaw_rate_command(self):
         heading_error = wrap_to_pi(self._target_heading - self._robot.data.heading_w.torch)
-        self._commands[:, 2] = torch.clamp(heading_error * self.cfg.heading_control_stiffness, min=-1.0, max=1.0)
+        stiffness = self.cfg.stage1_heading_control_stiffness if self.cfg.stage1 else self.cfg.heading_control_stiffness
+        max_rate = self.cfg.stage1_max_yaw_rate if self.cfg.stage1 else 1.0
+        self._commands[:, 2] = torch.clamp(heading_error * stiffness, min=-max_rate, max=max_rate)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._actions = actions.clone()
         self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos.torch
 
-        # resample commands on a fixed period, and steer toward the target heading every step
-        self._command_time_left -= self.step_dt
-        resample_env_ids = (self._command_time_left <= 0.0).nonzero(as_tuple=False).flatten()
-        if len(resample_env_ids) > 0:
-            self._resample_commands(resample_env_ids)
+        # Stage 1 holds the reset heading; the original mode periodically chooses a new target.
+        if not self.cfg.stage1:
+            self._command_time_left -= self.step_dt
+            resample_env_ids = (self._command_time_left <= 0.0).nonzero(as_tuple=False).flatten()
+            if len(resample_env_ids) > 0:
+                self._resample_commands(resample_env_ids)
         self._update_yaw_rate_command()
 
     def _apply_action(self) -> None:
@@ -124,11 +158,16 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
+        if self.cfg.stage1:
+            touchdown_foot, valid_touchdown = self._prepare_stage1_touchdown()
         reward = torch.zeros(self.num_envs, device=self.device)
         for name, value in compute_rewards(self, self.cfg.rewards).items():
-            weight = getattr(self.cfg.rewards, name, None)
+            weight = (
+                self.cfg.rewards.stage1_weights.get(name) if self.cfg.stage1 else getattr(self.cfg.rewards, name, None)
+            )
             if weight is None:
-                raise KeyError(f"Reward term '{name}' has no weight: add `{name} = ...` to RewardsCfg in rewards.py")
+                location = "RewardsCfg.stage1_weights" if self.cfg.stage1 else "RewardsCfg"
+                raise KeyError(f"Reward term '{name}' has no weight in {location} in rewards.py")
             value = value * weight * self.step_dt
             if name not in self._episode_sums:
                 self._episode_sums[name] = torch.zeros(self.num_envs, device=self.device)
@@ -140,27 +179,107 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         vel_yaw = quat_apply_inverse(yaw_quat(data.root_quat_w.torch), data.root_lin_vel_w.torch[:, :3])
         self._error_vel_xy_sum += torch.linalg.norm(self._commands[:, :2] - vel_yaw[:, :2], dim=1)
         self._error_vel_yaw_sum += torch.abs(self._commands[:, 2] - data.root_ang_vel_w.torch[:, 2])
+        if self.cfg.stage1:
+            self._accumulate_stage1_metrics(vel_yaw)
+            # Update history only after the reward has compared this event with the previous landing.
+            self._stage1_last_touchdown[valid_touchdown] = touchdown_foot[valid_touchdown]
         return reward
 
+    def _prepare_stage1_touchdown(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recognize a single supported landing, rejecting chatter, hops and simultaneous landings."""
+        contact = self._contact_sensor.data
+        first = self._contact_sensor.compute_first_contact(self.step_dt).torch[:, self._feet_sensor_ids]
+        in_contact = contact.current_contact_time.torch[:, self._feet_sensor_ids] > 0.0
+        last_air_time = contact.last_air_time.torch[:, self._feet_sensor_ids]
+        foot = first.long().argmax(dim=1)
+        air_time = last_air_time.gather(1, foot.unsqueeze(1)).squeeze(1)
+        other_support = in_contact.gather(1, (1 - foot).unsqueeze(1)).squeeze(1)
+        valid = (
+            (first.sum(dim=1) == 1)
+            & other_support
+            & (air_time >= self.cfg.rewards.stage1_min_air_time)
+            & (air_time <= self.cfg.rewards.stage1_max_air_time)
+            & ~self.reset_terminated
+        )
+        self._stage1_alternating_touchdown[:] = (
+            valid & (self._stage1_last_touchdown >= 0) & (foot != self._stage1_last_touchdown)
+        )
+        return foot, valid
+
+    def _accumulate_stage1_metrics(self, vel_yaw: torch.Tensor) -> None:
+        """Track full-episode metrics and a second set excluding the first two seconds."""
+        data = self._robot.data
+        offset = data.root_pos_w.torch[:, :2] - self._stage1_start_pos[:, :2]
+        heading = self._target_heading
+        in_contact = self._contact_sensor.data.current_contact_time.torch[:, self._feet_sensor_ids] > 0.0
+        feet_speed = data.body_lin_vel_w.torch[:, self._feet_body_ids, :2].norm(dim=-1)
+        values = {
+            "forward_speed": vel_yaw[:, 0],
+            "lateral_deviation": (-heading.sin() * offset[:, 0] + heading.cos() * offset[:, 1]).abs(),
+            "heading_error": wrap_to_pi(heading - data.heading_w.torch).abs(),
+            "foot_slide_speed": (feet_speed * in_contact).sum(dim=1) / in_contact.sum(dim=1).clamp_min(1),
+        }
+        self._stage1_episode_steps += 1
+        steady = self._stage1_episode_steps > round(self.cfg.stage1_metrics_warmup_s / self.step_dt)
+        self._stage1_steady_steps += steady.long()
+        self._stage1_alternating_steps += self._stage1_alternating_touchdown.float()
+        for name, value in values.items():
+            self._stage1_metric_sums[name] += value
+            self._stage1_steady_metric_sums[name] += value * steady
+
+    def _stage1_episode_logs(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Summarize completed episodes before reset; heading errors are in radians."""
+        ids = env_ids[self._stage1_episode_steps[env_ids] > 0]
+        if len(ids) == 0:
+            return {}
+        steps = self._stage1_episode_steps[ids].float()
+        logs = {
+            "Episode_Stage1/length_s": (steps * self.step_dt).mean(),
+            "Episode_Stage1/survival_rate": (~self.reset_terminated[ids]).float().mean(),
+            "Episode_Stage1/alternating_steps": self._stage1_alternating_steps[ids].mean(),
+        }
+        for name, value in self._stage1_termination_causes.items():
+            logs["Episode_Termination/" + name] = torch.count_nonzero(value[ids])
+        for name, value in self._stage1_metric_sums.items():
+            logs["Metrics/stage1_" + name] = (value[ids] / steps).mean()
+        steady_ids = ids[self._stage1_steady_steps[ids] > 0]
+        if len(steady_ids) > 0:
+            for name, value in self._stage1_steady_metric_sums.items():
+                logs["Metrics/stage1_steady_" + name] = (
+                    value[steady_ids] / self._stage1_steady_steps[steady_ids]
+                ).mean()
+        return logs
+
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        time_out = self.episode_length_buf >= self.max_episode_length - (0 if self.cfg.stage1 else 1)
         # the torso touching anything counts as a fall
         torso_forces = self._contact_sensor.data.net_normal_forces_w_history.torch[:, :, self._torso_sensor_ids]
         died = torch.any(
             torch.max(torch.norm(torso_forces, dim=-1), dim=1)[0] > self.cfg.torso_contact_threshold, dim=1
         )
+        if self.cfg.stage1:
+            data = self._robot.data
+            height = data.root_pos_w.torch[:, 2] - self._terrain.env_origins[:, 2]
+            tilted = -data.projected_gravity_b.torch[:, 2] < math.cos(math.radians(self.cfg.stage1_max_tilt_deg))
+            low = height < self._stage1_target_height * self.cfg.stage1_min_height_ratio
+            self._stage1_termination_causes["torso_contact"][:] = died
+            self._stage1_termination_causes["excessive_tilt"][:] = tilted
+            self._stage1_termination_causes["low_height"][:] = low
+            died = died | tilted | low
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = wp.to_torch(self._robot._ALL_INDICES)
         # the curriculum reads how far each robot walked, so it must run before the root pose is reset
-        episode_steps = self.episode_length_buf[env_ids].float().clamp_min(1.0)
+        step_buffer = self._stage1_episode_steps if self.cfg.stage1 else self.episode_length_buf
+        episode_steps = step_buffer[env_ids].float().clamp_min(1.0)
+        stage1_logs = self._stage1_episode_logs(env_ids) if self.cfg.stage1 else {}
         if self.cfg.terrain_curriculum:
             self._update_terrain_curriculum(env_ids)
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
-        if len(env_ids) == self.num_envs:
+        if len(env_ids) == self.num_envs and not self.cfg.stage1:
             # spread out the resets to avoid spikes in training when many environments reset at a similar time
             self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
         index_fill_(self._actions, env_ids, 0.0)
@@ -186,6 +305,8 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._robot.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
         # commands depend on the new heading, so sample them after the root pose is written
+        if self.cfg.stage1:
+            self._reset_stage1_state(env_ids, root_pose)
         self._resample_commands(env_ids)
 
         # logging
@@ -197,10 +318,28 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
         extras["Metrics/error_vel_xy"] = torch.mean(self._error_vel_xy_sum[env_ids] / episode_steps)
         extras["Metrics/error_vel_yaw"] = torch.mean(self._error_vel_yaw_sum[env_ids] / episode_steps)
-        extras["Metrics/terrain_level"] = torch.mean(self._terrain.terrain_levels.float())
+        extras["Metrics/terrain_level"] = (
+            torch.zeros((), device=self.device) if self.cfg.stage1 else torch.mean(self._terrain.terrain_levels.float())
+        )
+        extras.update(stage1_logs)
         index_fill_(self._error_vel_xy_sum, env_ids, 0.0)
         index_fill_(self._error_vel_yaw_sum, env_ids, 0.0)
         self.extras["log"] = extras
+
+    def _reset_stage1_state(self, env_ids: torch.Tensor, root_pose: torch.Tensor) -> None:
+        """Capture the composed reset quaternion directly, without reading a stale simulator pose."""
+        self._stage1_start_pos[env_ids] = root_pose[:, :3]
+        self._stage1_target_height[env_ids] = self._robot.data.default_root_pose.torch[env_ids, 2]
+        w, x, y, z = root_pose[:, 3:7].unbind(dim=1)
+        self._target_heading[env_ids] = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+        self._stage1_last_touchdown[env_ids] = -1
+        self._stage1_alternating_touchdown[env_ids] = False
+        self._stage1_episode_steps[env_ids] = 0
+        self._stage1_steady_steps[env_ids] = 0
+        self._stage1_alternating_steps[env_ids] = 0.0
+        for buffers in (self._stage1_metric_sums, self._stage1_steady_metric_sums, self._stage1_termination_causes):
+            for value in buffers.values():
+                value[env_ids] = 0
 
     def _update_terrain_curriculum(self, env_ids: torch.Tensor):
         """Move robots that crossed their terrain tile to harder terrain, and those that barely moved to easier."""
