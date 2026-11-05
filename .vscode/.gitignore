@@ -1,9 +1,9 @@
-# Note: These files are kept for development purposes only.
+# Ignore local editor settings and generated Python environment configuration.
+.python.env
+*.json
+
+# Keep shared development settings and templates; exceptions must follow *.json.
 !tools/launch.template.json
 !tools/settings.template.json
 !extensions.json
 !tasks.json
-
-# Ignore all other files
-.python.env
-*.json

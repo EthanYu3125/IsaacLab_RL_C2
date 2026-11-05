@@ -1,18 +1,115 @@
+# Python / uv：保留 pyproject.toml 與 uv.lock
 .venv/
-.pytest_cache/
-.ruff_cache/
-**/__pycache__/
-**/*.egg-info/
+venv/
+env/
+ENV/
+__pypackages__/
+__pycache__/
 *.py[cod]
+*$py.class
+.Python
+.python-version
+
+# Python 建置與套件中繼資料
 build/
 dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+.installed.cfg
+*.manifest
 
+# 測試、靜態分析與覆蓋率
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit.xml
+pytest-report.xml
+
+# Isaac Lab / skrl：訓練、評估與錄影產出
 logs/
 outputs/
 videos/
+recordings/
+checkpoints/
 wandb/
+mlruns/
+mlartifacts/
+tensorboard/
+events.out.tfevents.*
+*.log
+*.log.*
 
+# 模型權重與部署匯出；必要的固定測試模型請明確以 git add -f 加入
+*.pt
+*.pth
+*.ckpt
+*.jit
+*.onnx
+*.onnx.data
+*.engine
+/exports/
+
+# Isaac Sim / Omniverse / Warp / CUDA 本機快取與效能分析
+# 保留 USD、URDF、網格、材質與資料集；不要全域忽略 assets/ 或 data/
+.cache/
+.nv/
+.nvidia-omniverse/
+.isaacsim/
+.warp_cache/
+warp_cache/
+__warp_cache__/
+.torch/
+.triton/
+/_isaac_sim
+/_isaacsim
+imgui.ini
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.nvvp
+
+# 本機環境與憑證：保留可共用的範例設定
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+.python.env
+
+# IDE：沿用 .vscode/.gitignore，保留 extensions.json、tasks.json 與範本
 .vscode/settings.json
 .vscode/launch.json
+.vscode/*.code-workspace
+.vscode/.ropeproject/
+.idea/
+.vs/
 pyrightconfig.json
-imgui.ini
+.ipynb_checkpoints/
+
+# 編輯器暫存與作業系統中繼資料
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+.DS_Store
+.AppleDouble/
+.LSOverride
+._*
+__MACOSX/
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
