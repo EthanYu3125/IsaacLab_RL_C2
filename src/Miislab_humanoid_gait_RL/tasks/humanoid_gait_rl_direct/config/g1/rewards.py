@@ -32,25 +32,28 @@ class RewardsCfg:
 
     # ==================== TODO: EDIT BELOW (reward weights and parameters) ====================
     # 權重為正表示鼓勵該行為，為負表示懲罰該行為，設為 0 則停用該項
-    termination = -200.0            # 懲罰非預期終止
-    track_lin_vel_xy_exp = 1.0      # 鼓勵追蹤平面線速度指令
-    track_ang_vel_z_exp = 2.0       # 鼓勵追蹤繞垂直軸的角速度指令
-    ang_vel_xy_l2 = -0.05           # 懲罰機身在水平軸上的角速度
-    flat_orientation_l2 = -1.0      # 懲罰機身偏離水平姿態
-    dof_torques_l2 = -1.5e-7        # 懲罰腿部關節施力過大
-    dof_acc_l2 = -1.25e-7           # 懲罰腿部關節加速度過大
-    action_rate_l2 = -0.005         # 懲罰相鄰控制步驟的動作變化過大
-    dof_pos_limits = -1.0           # 懲罰踝關節超出軟性位置限制
-    joint_deviation_hip = -0.1      # 懲罰髖關節偏離預設姿勢
-    joint_deviation_arms = -0.1     # 懲罰手臂關節偏離預設姿勢
+    termination = -200.0  # 懲罰非預期終止
+    track_lin_vel_xy_exp = 1.0  # 鼓勵追蹤平面線速度指令
+    track_ang_vel_z_exp = 2.0  # 鼓勵追蹤繞垂直軸的角速度指令
+    ang_vel_xy_l2 = -0.05  # 懲罰機身在水平軸上的角速度
+    flat_orientation_l2 = -1.0  # 懲罰機身偏離水平姿態
+    dof_torques_l2 = -1.5e-7  # 懲罰腿部關節施力過大
+    dof_acc_l2 = -1.25e-7  # 懲罰腿部關節加速度過大
+    action_rate_l2 = -0.005  # 懲罰相鄰控制步驟的動作變化過大
+    dof_pos_limits = -1.0  # 懲罰踝關節超出軟性位置限制
+    joint_deviation_hip = -0.1  # 懲罰髖關節偏離預設姿勢
+    joint_deviation_arms = -0.1  # 懲罰手臂關節偏離預設姿勢
     joint_deviation_fingers = -0.05  # 懲罰手指關節偏離預設姿勢
-    joint_deviation_torso = -0.1    # 懲罰軀幹關節偏離預設姿勢
-    feet_air_time = 0.25            # 鼓勵單腳支撐時維持適當時間
-    feet_slide = -0.1               # 懲罰腳掌接觸地面時滑動
+    joint_deviation_torso = -0.1  # 懲罰軀幹關節偏離預設姿勢
+    feet_air_time = 0.25  # 鼓勵單腳支撐時維持適當時間
+    feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
+    feet_contact_rhythm = 0.5  # 鼓勵目前觸地時間接近上次觸地時間
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
     feet_air_time_max = 0.4  # [s], single-stance time rewarded per step
+    feet_contact_rhythm_min_time = 0.2  # [s], ignore short contacts and taps
+    feet_contact_rhythm_std = 0.1  # [s], contact-time difference at which the reward drops to exp(-1)
     feet_contact_force_threshold = 1.0  # [N], a foot pushing harder than this counts as touching the ground
     # ==================== TODO: END ====================
 
@@ -105,6 +108,16 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     feet_air_time = torch.min(torch.where(single_stance.unsqueeze(-1), in_mode_time, 0.0), dim=1)[0]
     feet_air_time = torch.clamp(feet_air_time, max=cfg.feet_air_time_max) * moving
 
+    # reward steady stance timing only after both the current and previous contacts pass the minimum duration
+    last_contact_time = contact.last_contact_time.torch[:, env._feet_sensor_ids]
+    rhythm_valid = (
+        (contact_time >= cfg.feet_contact_rhythm_min_time)
+        & (last_contact_time >= cfg.feet_contact_rhythm_min_time)
+        & moving.unsqueeze(-1)
+    )
+    rhythm_score = torch.exp(-torch.square((contact_time - last_contact_time) / cfg.feet_contact_rhythm_std))
+    feet_contact_rhythm = torch.sum(rhythm_score * rhythm_valid, dim=1) / rhythm_valid.sum(dim=1).clamp_min(1)
+
     # feet sliding while pressed on the ground
     feet_forces = contact.net_normal_forces_w_history.torch[:, :, env._feet_sensor_ids]
     feet_contact = feet_forces.norm(dim=-1).max(dim=1)[0] > cfg.feet_contact_force_threshold
@@ -126,6 +139,7 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         "joint_deviation_fingers": joint_deviation(env._finger_joint_ids),
         "joint_deviation_torso": joint_deviation(env._torso_joint_ids),
         "feet_air_time": feet_air_time,
+        "feet_contact_rhythm": feet_contact_rhythm,
         "feet_slide": feet_slide,
     }
     # ==================== TODO: END ====================
