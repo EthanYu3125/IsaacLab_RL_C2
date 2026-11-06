@@ -31,22 +31,22 @@ class RewardsCfg:
     """Reward weights, one per term name returned by :func:`compute_rewards`, and the term parameters."""
 
     # ==================== TODO: EDIT BELOW (reward weights and parameters) ====================
-    # weights: positive encourages the behavior, negative penalizes it, zero disables the term
-    termination = -200.0
-    track_lin_vel_xy_exp = 1.0
-    track_ang_vel_z_exp = 2.0
-    ang_vel_xy_l2 = -0.05
-    flat_orientation_l2 = -1.0
-    dof_torques_l2 = -1.5e-7
-    dof_acc_l2 = -1.25e-7
-    action_rate_l2 = -0.005
-    dof_pos_limits = -1.0
-    joint_deviation_hip = -0.1
-    joint_deviation_arms = -0.1
-    joint_deviation_fingers = -0.05
-    joint_deviation_torso = -0.1
-    feet_air_time = 0.25
-    feet_slide = -0.1
+    # 權重為正表示鼓勵該行為，為負表示懲罰該行為，設為 0 則停用該項
+    termination = -200.0            # 懲罰非預期終止
+    track_lin_vel_xy_exp = 1.0      # 鼓勵追蹤平面線速度指令
+    track_ang_vel_z_exp = 2.0       # 鼓勵追蹤繞垂直軸的角速度指令
+    ang_vel_xy_l2 = -0.05           # 懲罰機身在水平軸上的角速度
+    flat_orientation_l2 = -1.0      # 懲罰機身偏離水平姿態
+    dof_torques_l2 = -1.5e-7        # 懲罰腿部關節施力過大
+    dof_acc_l2 = -1.25e-7           # 懲罰腿部關節加速度過大
+    action_rate_l2 = -0.005         # 懲罰相鄰控制步驟的動作變化過大
+    dof_pos_limits = -1.0           # 懲罰踝關節超出軟性位置限制
+    joint_deviation_hip = -0.1      # 懲罰髖關節偏離預設姿勢
+    joint_deviation_arms = -0.1     # 懲罰手臂關節偏離預設姿勢
+    joint_deviation_fingers = -0.05  # 懲罰手指關節偏離預設姿勢
+    joint_deviation_torso = -0.1    # 懲罰軀幹關節偏離預設姿勢
+    feet_air_time = 0.25            # 鼓勵單腳支撐時維持適當時間
+    feet_slide = -0.1               # 懲罰腳掌接觸地面時滑動
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
