@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            // Use the interpreter recorded by `isaaclab --editor`; VS Code skips wrapper scripts such as python.sh
+            "python": "${config:python.defaultInterpreterPath}",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train MiislabHumanoidGaitRl-Humanoid-Gait-Rl-G1-Direct with skrl (PPO)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${config:python.defaultInterpreterPath}",
+            "module": "isaaclab",
+            "args": [
+                "train",
+                "--rl_library", "skrl",
+                "--task", "MiislabHumanoidGaitRl-Humanoid-Gait-Rl-G1-Direct",
+                "--num_envs", "4096",
+                "--algorithm", "PPO"            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Play MiislabHumanoidGaitRl-Humanoid-Gait-Rl-G1-Direct with skrl (PPO)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${config:python.defaultInterpreterPath}",
+            "module": "isaaclab",
+            "args": [
+                "play",
+                "--rl_library", "skrl",
+                "--task", "MiislabHumanoidGaitRl-Humanoid-Gait-Rl-G1-Direct",
+                "--num_envs", "32",
+                "--algorithm", "PPO"            ],
+            "console": "integratedTerminal"
+        },
+    ]
+}
