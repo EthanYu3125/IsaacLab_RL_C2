@@ -15,7 +15,9 @@ def test_task_registrations():
     expected = {
         "Miislab-Humanoid-Gait-Rl-G1-Direct-v1": {
             "entry_point": "Miislab_humanoid_gait_RL.tasks.humanoid_gait_rl_direct.config.g1.env:HumanoidGaitRlEnv",
-            "env_cfg_entry_point": "Miislab_humanoid_gait_RL.tasks.humanoid_gait_rl_direct.config.g1.env_cfg:HumanoidGaitRlEnvCfg",
+            "env_cfg_entry_point": (
+                "Miislab_humanoid_gait_RL.tasks.humanoid_gait_rl_direct.config.g1.env_cfg:HumanoidGaitRlEnvCfg"
+            ),
             "default_agent": "skrl",
         },
     }

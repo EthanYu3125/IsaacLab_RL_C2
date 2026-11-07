@@ -56,31 +56,31 @@ def quat_from_euler_xyz(roll, pitch, yaw):
     cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)
     return torch.stack(
         (
-            cr * cp * cy + sr * sp * sy,
             sr * cp * cy - cr * sp * sy,
             cr * sp * cy + sr * cp * sy,
             cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
         ),
         dim=-1,
     )
 
 
 def quat_mul(a, b):
-    scalar = a[:, :1] * b[:, :1] - (a[:, 1:] * b[:, 1:]).sum(dim=-1, keepdim=True)
-    vector = a[:, :1] * b[:, 1:] + b[:, :1] * a[:, 1:] + torch.cross(a[:, 1:], b[:, 1:], dim=-1)
-    return torch.cat((scalar, vector), dim=-1)
+    scalar = a[:, 3:] * b[:, 3:] - (a[:, :3] * b[:, :3]).sum(dim=-1, keepdim=True)
+    vector = a[:, 3:] * b[:, :3] + b[:, 3:] * a[:, :3] + torch.cross(a[:, :3], b[:, :3], dim=-1)
+    return torch.cat((vector, scalar), dim=-1)
 
 
 def yaw_quat(q):
-    w, x, y, z = q.unbind(dim=-1)
+    x, y, z, w = q.unbind(dim=-1)
     yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y.square() + z.square()))
     return quat_from_euler_xyz(torch.zeros_like(yaw), torch.zeros_like(yaw), yaw)
 
 
 def quat_apply_inverse(q, vector):
-    inverse = torch.cat((q[:, :1], -q[:, 1:]), dim=-1)
-    vector_q = torch.cat((torch.zeros_like(vector[:, :1]), vector), dim=-1)
-    return quat_mul(quat_mul(inverse, vector_q), q)[:, 1:]
+    inverse = torch.cat((-q[:, :3], q[:, 3:]), dim=-1)
+    vector_q = torch.cat((vector, torch.zeros_like(vector[:, :1])), dim=-1)
+    return quat_mul(quat_mul(inverse, vector_q), q)[:, :3]
 
 
 class BaseEnv:
@@ -187,7 +187,8 @@ class ContactSensor:
 class Robot:
     def __init__(self, num_envs):
         pose = torch.zeros(num_envs, 7)
-        pose[:, 2:4] = torch.tensor([0.74, 1.0])
+        pose[:, 2] = 0.74
+        pose[:, 6] = 1.0
         velocity = torch.zeros(num_envs, 3)
         velocity[:, 0] = 0.5
         gravity = torch.tensor([0.0, 0.0, -1.0]).repeat(num_envs, 1)
@@ -213,6 +214,7 @@ class Robot:
             }
         )
         self.data = SimpleNamespace(**{name: proxy(value) for name, value in tensors.items()})
+        self.data.root_lin_vel_b = self.data.root_com_lin_vel_b
         self.actuators = SimpleNamespace(applied_effort=proxy(torch.zeros(num_envs, 37)))
         self._ALL_INDICES = torch.arange(num_envs)
 
@@ -223,11 +225,13 @@ class Robot:
         self.data.root_pos_w.torch[env_ids] = root_pose[:, :3]
         self.data.root_quat_w.torch[env_ids] = root_pose[:, 3:]
         q = yaw_quat(root_pose[:, 3:])
-        self.data.heading_w.torch[env_ids] = 2 * torch.atan2(q[:, 3], q[:, 0])
+        self.data.heading_w.torch[env_ids] = wrap_to_pi(2 * torch.atan2(q[:, 2], q[:, 3]))
 
     def write_root_velocity_to_sim_index(self, root_velocity, env_ids):
         self.data.root_lin_vel_w.torch[env_ids] = root_velocity[:, :3]
         self.data.root_ang_vel_w.torch[env_ids] = root_velocity[:, 3:]
+        q = self.data.root_quat_w.torch[env_ids]
+        self.data.root_lin_vel_b.torch[env_ids] = quat_apply_inverse(q, root_velocity[:, :3])
 
     def write_joint_position_to_sim_index(self, position, env_ids):
         self.data.joint_pos.torch[env_ids] = position

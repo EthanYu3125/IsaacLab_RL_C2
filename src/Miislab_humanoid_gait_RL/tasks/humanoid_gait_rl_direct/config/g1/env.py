@@ -84,6 +84,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._stage1_episode_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._stage1_steady_steps = torch.zeros_like(self._stage1_episode_steps)
         self._stage1_alternating_steps = torch.zeros(self.num_envs, device=self.device)
+        self._stage1_max_lateral_deviation = torch.zeros(self.num_envs, device=self.device)
         self._stage1_metric_sums = {
             key: torch.zeros(self.num_envs, device=self.device)
             for key in ("forward_speed", "lateral_deviation", "heading_error", "foot_slide_speed")
@@ -93,7 +94,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         }
         self._stage1_termination_causes = {
             key: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            for key in ("torso_contact", "excessive_tilt", "low_height")
+            for key in ("torso_contact", "excessive_tilt", "low_height", "lateral_out_of_bounds")
         }
 
     def _resample_commands(self, env_ids: torch.Tensor):
@@ -223,6 +224,9 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         steady = self._stage1_episode_steps > round(self.cfg.stage1_metrics_warmup_s / self.step_dt)
         self._stage1_steady_steps += steady.long()
         self._stage1_alternating_steps += self._stage1_alternating_touchdown.float()
+        self._stage1_max_lateral_deviation[:] = torch.maximum(
+            self._stage1_max_lateral_deviation, values["lateral_deviation"]
+        )
         for name, value in values.items():
             self._stage1_metric_sums[name] += value
             self._stage1_steady_metric_sums[name] += value * steady
@@ -233,10 +237,18 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         if len(ids) == 0:
             return {}
         steps = self._stage1_episode_steps[ids].float()
+        offset = self._robot.data.root_pos_w.torch[ids, :2] - self._stage1_start_pos[ids, :2]
+        heading = self._target_heading[ids]
+        forward_displacement = heading.cos() * offset[:, 0] + heading.sin() * offset[:, 1]
         logs = {
             "Episode_Stage1/length_s": (steps * self.step_dt).mean(),
             "Episode_Stage1/survival_rate": (~self.reset_terminated[ids]).float().mean(),
             "Episode_Stage1/alternating_steps": self._stage1_alternating_steps[ids].mean(),
+            "Episode_Stage1/lateral_out_of_bounds_rate": self._stage1_termination_causes["lateral_out_of_bounds"][ids]
+            .float()
+            .mean(),
+            "Metrics/stage1_forward_displacement": forward_displacement.mean(),
+            "Metrics/stage1_max_lateral_deviation": self._stage1_max_lateral_deviation[ids].mean(),
         }
         for name, value in self._stage1_termination_causes.items():
             logs["Episode_Termination/" + name] = torch.count_nonzero(value[ids])
@@ -262,10 +274,17 @@ class HumanoidGaitRlEnv(DirectRLEnv):
             height = data.root_pos_w.torch[:, 2] - self._terrain.env_origins[:, 2]
             tilted = -data.projected_gravity_b.torch[:, 2] < math.cos(math.radians(self.cfg.stage1_max_tilt_deg))
             low = height < self._stage1_target_height * self.cfg.stage1_min_height_ratio
+            offset = data.root_pos_w.torch[:, :2] - self._stage1_start_pos[:, :2]
+            heading = self._target_heading
+            lateral_offset = -heading.sin() * offset[:, 0] + heading.cos() * offset[:, 1]
+            out_of_bounds = (
+                lateral_offset.abs() > self.cfg.stage1_max_lateral_deviation
+            ) & self.cfg.stage1_enable_lateral_termination
             self._stage1_termination_causes["torso_contact"][:] = died
             self._stage1_termination_causes["excessive_tilt"][:] = tilted
             self._stage1_termination_causes["low_height"][:] = low
-            died = died | tilted | low
+            self._stage1_termination_causes["lateral_out_of_bounds"][:] = out_of_bounds
+            died = died | tilted | low | out_of_bounds
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -285,7 +304,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         index_fill_(self._actions, env_ids, 0.0)
         index_fill_(self._previous_actions, env_ids, 0.0)
 
-        # root pose: random x/y offset and yaw around the env origin, zero velocity
+        # root pose: random x/y offset, fixed yaw by default, zero velocity
         num = len(env_ids)
         pose_range = self.cfg.reset_pose_range
         root_pose = self._robot.data.default_root_pose.torch[env_ids].clone()
@@ -315,7 +334,11 @@ class HumanoidGaitRlEnv(DirectRLEnv):
             extras["Episode_Reward/" + key] = torch.mean(self._episode_sums[key][env_ids]) / self.max_episode_length_s
             index_fill_(self._episode_sums[key], env_ids, 0.0)
         extras["Episode_Termination/torso_contact"] = torch.count_nonzero(self.reset_terminated[env_ids])
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids])
+        # Simultaneous failure and time limit is a failed episode, not a successful completion.
+        completed = self.reset_time_outs[env_ids]
+        if self.cfg.stage1:
+            completed = completed & ~self.reset_terminated[env_ids]
+        extras["Episode_Termination/time_out"] = torch.count_nonzero(completed)
         extras["Metrics/error_vel_xy"] = torch.mean(self._error_vel_xy_sum[env_ids] / episode_steps)
         extras["Metrics/error_vel_yaw"] = torch.mean(self._error_vel_yaw_sum[env_ids] / episode_steps)
         extras["Metrics/terrain_level"] = (
@@ -330,13 +353,14 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         """Capture the composed reset quaternion directly, without reading a stale simulator pose."""
         self._stage1_start_pos[env_ids] = root_pose[:, :3]
         self._stage1_target_height[env_ids] = self._robot.data.default_root_pose.torch[env_ids, 2]
-        w, x, y, z = root_pose[:, 3:7].unbind(dim=1)
+        x, y, z, w = root_pose[:, 3:7].unbind(dim=1)  # Isaac Lab quaternions use XYZW.
         self._target_heading[env_ids] = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
         self._stage1_last_touchdown[env_ids] = -1
         self._stage1_alternating_touchdown[env_ids] = False
         self._stage1_episode_steps[env_ids] = 0
         self._stage1_steady_steps[env_ids] = 0
         self._stage1_alternating_steps[env_ids] = 0.0
+        self._stage1_max_lateral_deviation[env_ids] = 0.0
         for buffers in (self._stage1_metric_sums, self._stage1_steady_metric_sums, self._stage1_termination_causes):
             for value in buffers.values():
                 value[env_ids] = 0

@@ -153,10 +153,12 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     stage1_max_yaw_rate = 0.5  # [rad/s], corrective turns only
     stage1_max_tilt_deg = 60.0
     stage1_min_height_ratio = 0.55
+    stage1_enable_lateral_termination = True  # temporarily disable failure for excessive path deviation
+    stage1_max_lateral_deviation = 3.0  # [m], fail strictly beyond either side of the reset line
     stage1_metrics_warmup_s = 2.0  # exclude startup from steady-walking metrics
 
-    # reset: random root pose offset around the env origin
-    reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)}
+    # reset: random x/y offset, fixed default robot heading (+X)
+    reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)}
 
     # termination: torso contact force above this is a fall [N]
     torso_contact_threshold = 1.0
@@ -193,18 +195,9 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         positive = {
             "stage1_lin_vel_x": self.stage1_lin_vel_x,
             "stage1_max_yaw_rate": self.stage1_max_yaw_rate,
+            "stage1_max_lateral_deviation": self.stage1_max_lateral_deviation,
             "scene.env_spacing": self.scene.env_spacing,
-            **{
-                name: getattr(self.rewards, name)
-                for name in (
-                    "stage1_tracking_std",
-                    "stage1_yaw_tracking_std",
-                    "stage1_lateral_scale",
-                    "stage1_idle_speed",
-                    "stage1_height_scale",
-                    "stage1_swing_time_std",
-                )
-            },
+            "tracking_std": self.rewards.tracking_std,
         }
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
