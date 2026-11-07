@@ -403,7 +403,7 @@ def test_observation_and_action_contract(env):
 @pytest.mark.parametrize("play_before", [False, True])
 def test_mode_applied_after_overrides_and_flat_play_is_safe(modules, play_before):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
-    assert cfg.stage1
+    cfg.stage1 = True
     assert cfg.scene.terrain.terrain_type == "generator"  # not prematurely converted in __post_init__
     if play_before:
         cfg.play_mode()
@@ -427,6 +427,7 @@ def test_mode_applied_after_overrides_and_flat_play_is_safe(modules, play_before
 @pytest.mark.parametrize("invalid", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_tracking_scale_rejected(modules, invalid):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    cfg.stage1 = True
     cfg.rewards.tracking_std = invalid
     with pytest.raises(ValueError, match="tracking_std"):
         cfg.configure_stage1()
@@ -503,11 +504,12 @@ def test_configuration_instances_do_not_share_weights(modules):
 
 
 @pytest.mark.parametrize("side", [-1.0, 1.0])
-@pytest.mark.parametrize("distance,failed", [(2.999, False), (3.0, False), (3.001, True)])
+@pytest.mark.parametrize("distance,failed", [(1.499, False), (1.5, False), (1.501, True)])
 @pytest.mark.parametrize("play", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_lateral_failure_boundary(env, side, distance, failed, play, enabled):
-    assert not env.cfg.stage1_enable_lateral_termination
+@pytest.mark.parametrize("stage1", [False, True])
+def test_lateral_failure_boundary(modules, side, distance, failed, play, enabled, stage1):
+    env = make_env(modules, stage1=stage1)
     env.cfg.stage1_enable_lateral_termination = enabled
     failed = failed and enabled
     if play:
@@ -516,7 +518,9 @@ def test_lateral_failure_boundary(env, side, distance, failed, play, enabled):
     terminated, timed_out = env._get_dones()
     assert terminated.tolist() == [failed] * env.num_envs
     assert not timed_out.any()
-    assert env._stage1_termination_causes["lateral_out_of_bounds"].tolist() == [failed] * env.num_envs
+    assert env._lateral_out_of_bounds.tolist() == [failed] * env.num_envs
+    if stage1:
+        assert env._stage1_termination_causes["lateral_out_of_bounds"].tolist() == [failed] * env.num_envs
 
 
 @pytest.mark.parametrize("heading", [0.0, math.pi / 2, -1.2])
@@ -527,7 +531,7 @@ def test_lateral_failure_uses_reset_line_not_world_axes_or_current_heading(env, 
     env._robot.data.heading_w.torch[:] = heading + 0.8
     forward = torch.tensor([math.cos(heading), math.sin(heading)])
     normal = torch.tensor([-math.sin(heading), math.cos(heading)])
-    offsets = torch.tensor([2.999, -2.999, 3.001, -3.001])
+    offsets = torch.tensor([1.499, -1.499, 1.501, -1.501])
     env._robot.data.root_pos_w.torch[:, :2] = env._stage1_start_pos[:, :2] + 100.0 * forward + offsets[:, None] * normal
     terminated, _ = env._get_dones()
     assert terminated.tolist() == [False, False, True, True]
@@ -536,8 +540,10 @@ def test_lateral_failure_uses_reset_line_not_world_axes_or_current_heading(env, 
 
 
 @pytest.mark.parametrize("invalid", [0.0, -1.0, float("nan"), float("inf"), -float("inf")])
-def test_invalid_lateral_limit_rejected(modules, invalid):
+@pytest.mark.parametrize("stage1", [False, True])
+def test_invalid_lateral_limit_rejected(modules, invalid, stage1):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    cfg.stage1 = stage1
     cfg.stage1_max_lateral_deviation = invalid
     with pytest.raises(ValueError, match="stage1_max_lateral_deviation"):
         cfg.configure_stage1()
@@ -550,7 +556,42 @@ def test_lateral_limit_override_and_original_mode(modules, env):
     assert env._get_dones()[0].all()
     rough = make_env(modules, stage1=False)
     rough._robot.data.root_pos_w.torch[:, 1] = 100.0
+    assert rough._get_dones()[0].all()
+    rough.cfg.stage1_enable_lateral_termination = False
     assert not rough._get_dones()[0].any()
+
+
+@pytest.mark.parametrize("stage1", [False, True])
+def test_spawn_line_failure_and_partial_reset_in_both_modes(modules, stage1):
+    env = make_env(modules, stage1=stage1)
+    env.cfg.terrain_curriculum = False  # The fixture has no terrain simulation.
+    env.cfg.reset_pose_range = {"x": (0.2, 0.2), "y": (-0.3, -0.3), "yaw": (0.7, 0.7)}
+    q = quat_from_euler_xyz(torch.zeros(1), torch.zeros(1), torch.tensor([0.4]))
+    env._robot.data.default_root_pose.torch[1, 3:] = q[0]
+    env._terrain.env_origins[1] = torch.tensor([10.0, 20.0, 0.0])
+    before = env._reset_line_start_pos.clone()
+    env._reset_idx(torch.tensor([1]))
+    torch.testing.assert_close(env._reset_line_start_pos[1], torch.tensor([10.2, 19.7]))
+    torch.testing.assert_close(env._reset_line_start_pos[[0, 2, 3]], before[[0, 2, 3]])
+    assert env._reset_line_heading[1].item() == pytest.approx(1.1)
+    if not stage1:
+        # Command resampling must not rotate the spawn line in the original mode.
+        env._target_heading[1] = -2.0
+    forward = torch.tensor([math.cos(1.1), math.sin(1.1)])
+    normal = torch.tensor([-math.sin(1.1), math.cos(1.1)])
+    env._robot.data.root_pos_w.torch[1, :2] = env._reset_line_start_pos[1] + 20.0 * forward + 1.501 * normal
+    env.episode_length_buf[1] = env.max_episode_length
+    env.reset_terminated[:], env.reset_time_outs[:] = env._get_dones()
+    assert env.reset_terminated.tolist() == [False, True, False, False]
+    assert env.reset_time_outs[1]
+    env._get_rewards()
+    # The simulator base class selects terminated rows for this same reset method.
+    env._reset_idx(env.reset_terminated.nonzero(as_tuple=False).squeeze(-1))
+    assert env.extras["log"]["Episode_Termination/lateral_out_of_bounds"].item() == 1
+    assert env.extras["log"]["Episode_Termination/torso_contact"].item() == 0
+    assert env.extras["log"]["Episode_Termination/time_out"].item() == 0
+    assert not env._lateral_out_of_bounds.any()
+    assert not env._get_dones()[0].any()
 
 
 def test_overlapping_failures_pay_once_and_timeout_is_not_success(env):
@@ -558,7 +599,7 @@ def test_overlapping_failures_pay_once_and_timeout_is_not_success(env):
     env.cfg.rewards.stage1_weights = {key: 0.0 for key in env.cfg.rewards.stage1_weights}
     env.cfg.rewards.stage1_weights["termination"] = -400.0
     env.episode_length_buf[:] = env.max_episode_length
-    env._robot.data.root_pos_w.torch[0, 1] = 3.001
+    env._robot.data.root_pos_w.torch[0, 1] = 1.501
     env._robot.data.root_pos_w.torch[0, 2] = 0.3
     env._robot.data.projected_gravity_b.torch[0] = torch.tensor([1.0, 0.0, 0.0])
     env._contact_sensor.data.net_normal_forces_w_history.torch[0, :, 2, 2] = 5.0

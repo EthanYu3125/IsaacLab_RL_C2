@@ -72,8 +72,16 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._error_vel_xy_sum = torch.zeros(self.num_envs, device=self.device)
         self._error_vel_yaw_sum = torch.zeros(self.num_envs, device=self.device)
 
+        self._init_reset_line_buffers()
         if self.cfg.stage1:
             self._init_stage1_buffers()
+
+    def _init_reset_line_buffers(self) -> None:
+        """Keep the spawn line independent of commands that may change during an episode."""
+        self._reset_line_start_pos = torch.zeros(self.num_envs, 2, device=self.device)
+        self._reset_line_heading = torch.zeros(self.num_envs, device=self.device)
+        self._lateral_out_of_bounds = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._torso_contact_termination = torch.zeros_like(self._lateral_out_of_bounds)
 
     def _init_stage1_buffers(self) -> None:
         """Allocate per-environment state; these buffers never enter the policy observation."""
@@ -269,23 +277,25 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         died = torch.any(
             torch.max(torch.norm(torso_forces, dim=-1), dim=1)[0] > self.cfg.torso_contact_threshold, dim=1
         )
+        self._torso_contact_termination[:] = died
+        data = self._robot.data
+        start_pos = self._stage1_start_pos[:, :2] if self.cfg.stage1 else self._reset_line_start_pos
+        heading = self._target_heading if self.cfg.stage1 else self._reset_line_heading
+        offset = data.root_pos_w.torch[:, :2] - start_pos
+        lateral_offset = -heading.sin() * offset[:, 0] + heading.cos() * offset[:, 1]
+        self._lateral_out_of_bounds[:] = (
+            lateral_offset.abs() > self.cfg.stage1_max_lateral_deviation
+        ) & self.cfg.stage1_enable_lateral_termination
         if self.cfg.stage1:
-            data = self._robot.data
             height = data.root_pos_w.torch[:, 2] - self._terrain.env_origins[:, 2]
             tilted = -data.projected_gravity_b.torch[:, 2] < math.cos(math.radians(self.cfg.stage1_max_tilt_deg))
             low = height < self._stage1_target_height * self.cfg.stage1_min_height_ratio
-            offset = data.root_pos_w.torch[:, :2] - self._stage1_start_pos[:, :2]
-            heading = self._target_heading
-            lateral_offset = -heading.sin() * offset[:, 0] + heading.cos() * offset[:, 1]
-            out_of_bounds = (
-                lateral_offset.abs() > self.cfg.stage1_max_lateral_deviation
-            ) & self.cfg.stage1_enable_lateral_termination
             self._stage1_termination_causes["torso_contact"][:] = died
             self._stage1_termination_causes["excessive_tilt"][:] = tilted
             self._stage1_termination_causes["low_height"][:] = low
-            self._stage1_termination_causes["lateral_out_of_bounds"][:] = out_of_bounds
-            died = died | tilted | low | out_of_bounds
-        return died, time_out
+            self._stage1_termination_causes["lateral_out_of_bounds"][:] = self._lateral_out_of_bounds
+            died = died | tilted | low
+        return died | self._lateral_out_of_bounds, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
@@ -294,6 +304,8 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         step_buffer = self._stage1_episode_steps if self.cfg.stage1 else self.episode_length_buf
         episode_steps = step_buffer[env_ids].float().clamp_min(1.0)
         stage1_logs = self._stage1_episode_logs(env_ids) if self.cfg.stage1 else {}
+        torso_failures = torch.count_nonzero(self._torso_contact_termination[env_ids])
+        lateral_failures = torch.count_nonzero(self._lateral_out_of_bounds[env_ids])
         if self.cfg.terrain_curriculum:
             self._update_terrain_curriculum(env_ids)
         self._robot.reset(env_ids)
@@ -324,6 +336,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._robot.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
         # commands depend on the new heading, so sample them after the root pose is written
+        self._reset_line_state(env_ids, root_pose)
         if self.cfg.stage1:
             self._reset_stage1_state(env_ids, root_pose)
         self._resample_commands(env_ids)
@@ -333,11 +346,10 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         for key in self._episode_sums:
             extras["Episode_Reward/" + key] = torch.mean(self._episode_sums[key][env_ids]) / self.max_episode_length_s
             index_fill_(self._episode_sums[key], env_ids, 0.0)
-        extras["Episode_Termination/torso_contact"] = torch.count_nonzero(self.reset_terminated[env_ids])
+        extras["Episode_Termination/torso_contact"] = torso_failures
+        extras["Episode_Termination/lateral_out_of_bounds"] = lateral_failures
         # Simultaneous failure and time limit is a failed episode, not a successful completion.
-        completed = self.reset_time_outs[env_ids]
-        if self.cfg.stage1:
-            completed = completed & ~self.reset_terminated[env_ids]
+        completed = self.reset_time_outs[env_ids] & ~self.reset_terminated[env_ids]
         extras["Episode_Termination/time_out"] = torch.count_nonzero(completed)
         extras["Metrics/error_vel_xy"] = torch.mean(self._error_vel_xy_sum[env_ids] / episode_steps)
         extras["Metrics/error_vel_yaw"] = torch.mean(self._error_vel_yaw_sum[env_ids] / episode_steps)
@@ -348,6 +360,13 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         index_fill_(self._error_vel_xy_sum, env_ids, 0.0)
         index_fill_(self._error_vel_yaw_sum, env_ids, 0.0)
         self.extras["log"] = extras
+
+    def _reset_line_state(self, env_ids: torch.Tensor, root_pose: torch.Tensor) -> None:
+        self._reset_line_start_pos[env_ids] = root_pose[:, :2]
+        x, y, z, w = root_pose[:, 3:7].unbind(dim=1)
+        self._reset_line_heading[env_ids] = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+        self._lateral_out_of_bounds[env_ids] = False
+        self._torso_contact_termination[env_ids] = False
 
     def _reset_stage1_state(self, env_ids: torch.Tensor, root_pose: torch.Tensor) -> None:
         """Capture the composed reset quaternion directly, without reading a stale simulator pose."""

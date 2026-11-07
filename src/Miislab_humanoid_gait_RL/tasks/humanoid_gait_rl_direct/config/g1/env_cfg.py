@@ -147,18 +147,18 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     is_play = False
 
     # Stage 1 commands are identical during training and play.
-    stage1 = True
+    stage1 = False
     stage1_lin_vel_x = 0.5  # [m/s]
     stage1_heading_control_stiffness = 1.0
     stage1_max_yaw_rate = 0.5  # [rad/s], corrective turns only
     stage1_max_tilt_deg = 60.0
     stage1_min_height_ratio = 0.55
-    stage1_enable_lateral_termination = True  # temporarily disable failure for excessive path deviation
-    stage1_max_lateral_deviation = 3.0  # [m], fail strictly beyond either side of the reset line
+    stage1_enable_lateral_termination = True  # fail when the distance from the reset line exceeds the limit
+    stage1_max_lateral_deviation = 1.5  # [m], fail strictly beyond either side of the reset line
     stage1_metrics_warmup_s = 2.0  # exclude startup from steady-walking metrics
 
     # reset: random x/y offset, fixed default robot heading (+X)
-    reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)}
+    reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)}
 
     # termination: torso contact force above this is a fall [N]
     torso_contact_threshold = 1.0
@@ -190,12 +190,13 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         Keep __post_init__ mode-neutral so a late ``env.stage1=False`` override
         retains the original generator and curriculum. Mode changes require a new environment.
         """
+        if not math.isfinite(self.stage1_max_lateral_deviation) or self.stage1_max_lateral_deviation <= 0.0:
+            raise ValueError("stage1_max_lateral_deviation must be finite and positive")
         if not self.stage1:
             return
         positive = {
             "stage1_lin_vel_x": self.stage1_lin_vel_x,
             "stage1_max_yaw_rate": self.stage1_max_yaw_rate,
-            "stage1_max_lateral_deviation": self.stage1_max_lateral_deviation,
             "scene.env_spacing": self.scene.env_spacing,
             "tracking_std": self.rewards.tracking_std,
         }

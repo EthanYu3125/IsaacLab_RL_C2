@@ -270,6 +270,8 @@ def make_env(modules, num_envs=4, stage1=True):
     env._leg_torque_joint_ids, env._leg_acc_joint_ids = list(range(12)), list(range(10))
     env._ankle_joint_ids, env._hip_joint_ids = [10, 11], [0, 1]
     env._arm_joint_ids, env._finger_joint_ids, env._torso_joint_ids = list(range(13, 23)), list(range(23, 37)), [12]
+    env._init_reset_line_buffers()
+    env._reset_line_state(torch.arange(num_envs), env._robot.data.default_root_pose.torch.clone())
     if stage1:
         env._init_stage1_buffers()
         env._reset_stage1_state(torch.arange(num_envs), env._robot.data.default_root_pose.torch.clone())

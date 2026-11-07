@@ -73,9 +73,9 @@ class RewardsCfg:
         "feet_air_time": 0.0,
         "feet_slide": -0.5,
         "forward_progress": 5.0,
-        "lateral_drift_l2": -2.0,
-        "heading_error_l2": -2.0,
-        "lateral_velocity_l2": -2.0,
+        "lateral_drift_l2": -2.4,  # modestly tighten the path for continuation training
+        "heading_error_l2": -2.2,
+        "lateral_velocity_l2": -2.2,
         "yaw_rate_error_l2": -0.2,
         "lin_vel_z_l2": -0.5,
     }
