@@ -48,7 +48,7 @@ class RewardsCfg:
     feet_air_time = 0.25  # 鼓勵單腳支撐時維持適當時間
     feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
     feet_contact_rhythm = 0.3  # 鼓勵目前觸地時間接近上次觸地時間
-    feet_force_symmetry = 0.2  # 鼓勵雙腳支撐時左右受力對稱
+    feet_force_symmetry = 0.1  # 鼓勵雙腳支撐時左右受力對稱
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
