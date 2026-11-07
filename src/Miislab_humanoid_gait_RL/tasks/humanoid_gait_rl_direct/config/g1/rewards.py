@@ -48,6 +48,7 @@ class RewardsCfg:
     feet_air_time = 0.25  # 鼓勵單腳支撐時維持適當時間
     feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
     feet_contact_rhythm = 0.2  # 鼓勵目前觸地時間接近上次觸地時間
+    feet_force_symmetry = 0.2  # 鼓勵雙腳支撐時左右受力對稱
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
@@ -55,6 +56,7 @@ class RewardsCfg:
     feet_contact_rhythm_min_time = 0.2  # [s], ignore short contacts and taps
     feet_contact_rhythm_std = 0.1  # [s], contact-time difference at which the reward drops to exp(-1)
     feet_contact_force_threshold = 1.0  # [N], a foot pushing harder than this counts as touching the ground
+    feet_force_symmetry_std = 0.25  # relative force imbalance at which the symmetry reward drops to exp(-1)
     # ==================== TODO: END ====================
 
 
@@ -118,9 +120,22 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     rhythm_score = torch.exp(-torch.square((contact_time - last_contact_time) / cfg.feet_contact_rhythm_std))
     feet_contact_rhythm = torch.sum(rhythm_score * rhythm_valid, dim=1) / rhythm_valid.sum(dim=1).clamp_min(1)
 
-    # feet sliding while pressed on the ground
     feet_forces = contact.net_normal_forces_w_history.torch[:, :, env._feet_sensor_ids]
-    feet_contact = feet_forces.norm(dim=-1).max(dim=1)[0] > cfg.feet_contact_force_threshold
+    feet_force_magnitudes = feet_forces.norm(dim=-1)
+    feet_contact = feet_force_magnitudes.max(dim=1)[0] > cfg.feet_contact_force_threshold
+
+    # compare left/right normal forces only during bilateral support
+    bilateral_contact = (feet_force_magnitudes > cfg.feet_contact_force_threshold).all(dim=-1)
+    force_imbalance = torch.abs(feet_force_magnitudes[..., 0] - feet_force_magnitudes[..., 1]) / (
+        feet_force_magnitudes[..., 0] + feet_force_magnitudes[..., 1]
+    ).clamp_min(cfg.feet_contact_force_threshold)
+    force_symmetry_score = torch.exp(-torch.square(force_imbalance / cfg.feet_force_symmetry_std))
+    valid_force_pair = bilateral_contact & moving.unsqueeze(-1)
+    feet_force_symmetry = torch.sum(force_symmetry_score * valid_force_pair, dim=1) / valid_force_pair.sum(
+        dim=1
+    ).clamp_min(1)
+
+    # feet sliding while pressed on the ground
     feet_vel = data.body_lin_vel_w.torch[:, env._feet_body_ids, :2]
     feet_slide = torch.sum(feet_vel.norm(dim=-1) * feet_contact, dim=1)
 
@@ -140,6 +155,7 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         "joint_deviation_torso": joint_deviation(env._torso_joint_ids),
         "feet_air_time": feet_air_time,
         "feet_contact_rhythm": feet_contact_rhythm,
+        "feet_force_symmetry": feet_force_symmetry,
         "feet_slide": feet_slide,
     }
     # ==================== TODO: END ====================
