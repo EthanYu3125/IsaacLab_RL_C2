@@ -57,6 +57,7 @@ class RewardsCfg:
     feet_contact_rhythm_std = 0.1  # [s], contact-time difference at which the reward drops to exp(-1)
     feet_contact_force_threshold = 1.0  # [N], a foot pushing harder than this counts as touching the ground
     feet_force_symmetry_std = 0.25  # relative force imbalance at which the symmetry reward drops to exp(-1)
+    feet_force_symmetry_max_total_contact_time = 0.6  # [s], max combined foot contact duration
     # ==================== TODO: END ====================
 
 
@@ -130,7 +131,9 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         feet_force_magnitudes[..., 0] + feet_force_magnitudes[..., 1]
     ).clamp_min(cfg.feet_contact_force_threshold)
     force_symmetry_score = torch.exp(-torch.square(force_imbalance / cfg.feet_force_symmetry_std))
-    valid_force_pair = bilateral_contact & moving.unsqueeze(-1)
+    total_contact_time = torch.sum(contact_time, dim=1)
+    contact_time_valid = total_contact_time <= cfg.feet_force_symmetry_max_total_contact_time
+    valid_force_pair = bilateral_contact & moving.unsqueeze(-1) & contact_time_valid.unsqueeze(-1)
     feet_force_symmetry = torch.sum(force_symmetry_score * valid_force_pair, dim=1) / valid_force_pair.sum(
         dim=1
     ).clamp_min(1)
