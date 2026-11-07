@@ -112,7 +112,26 @@ def load_task_modules(monkeypatch):
     module("isaaclab.sensors.patterns", GridPatternCfg=Config)
     module("isaaclab.terrains", TerrainImporterCfg=Config)
     module("isaaclab.terrains.config")
-    module("isaaclab.terrains.config.rough", ROUGH_TERRAINS_CFG=Config(num_rows=10, num_cols=20, curriculum=True))
+    module(
+        "isaaclab.terrains.config.rough",
+        ROUGH_TERRAINS_CFG=Config(
+            num_rows=10,
+            num_cols=20,
+            size=(8.0, 8.0),
+            curriculum=False,
+            sub_terrains={
+                name: Config(proportion=proportion)
+                for name, proportion in (
+                    ("pyramid_stairs", 0.2),
+                    ("pyramid_stairs_inv", 0.2),
+                    ("boxes", 0.2),
+                    ("random_rough", 0.2),
+                    ("hf_pyramid_slope", 0.1),
+                    ("hf_pyramid_slope_inv", 0.1),
+                )
+            },
+        ),
+    )
     module(
         "isaaclab.utils",
         configclass=configclass,
@@ -240,10 +259,36 @@ class Robot:
         self.data.joint_vel.torch[env_ids] = velocity
 
 
-def make_env(modules, num_envs=4, stage1=True):
+class Terrain:
+    """Synthetic origins for testing curriculum/reset ordering; no generated mesh or physics."""
+
+    def __init__(self, cfg, num_envs):
+        self.cfg = cfg
+        self.env_origins = torch.zeros(num_envs, 3)
+        self.terrain_levels = torch.zeros(num_envs, dtype=torch.long)
+        generator = cfg.terrain_generator
+        if generator is not None:
+            self.terrain_types = torch.arange(num_envs) * generator.num_cols // num_envs
+            self.terrain_origins = torch.zeros(generator.num_rows, generator.num_cols, 3)
+            self.terrain_origins[..., 0] = torch.arange(generator.num_rows).unsqueeze(1) * 8.0
+            self.terrain_origins[..., 1] = torch.arange(generator.num_cols) * 8.0
+            self.terrain_origins[..., 2] = torch.arange(generator.num_rows).unsqueeze(1) * 0.25
+        self.updates = []
+
+    def update_env_origins(self, ids, move_up, move_down):
+        self.updates.append((ids.clone(), move_up.clone(), move_down.clone()))
+        self.terrain_levels[ids] = (self.terrain_levels[ids] + move_up.long() - move_down.long()).clamp(
+            0, self.cfg.terrain_generator.num_rows - 1
+        )
+        self.env_origins[ids] = self.terrain_origins[self.terrain_levels[ids], self.terrain_types[ids]]
+
+
+def make_env(modules, num_envs=4, stage1=True, terrain_mode=None):
     env = object.__new__(modules.env.HumanoidGaitRlEnv)
     env.cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
     env.cfg.stage1 = stage1
+    # Existing gait unit tests explicitly exercise plane behavior; rough tests request the new default.
+    env.cfg.terrain_mode = terrain_mode or ("plane" if stage1 else "rough")
     env.cfg.configure_stage1()
     env.num_envs, env.device, env.step_dt = num_envs, "cpu", 0.02
     env.max_episode_length_s = env.cfg.episode_length_s
@@ -253,7 +298,7 @@ def make_env(modules, num_envs=4, stage1=True):
     env._height_scanner = SimpleNamespace(
         data=SimpleNamespace(pos_w=proxy(torch.zeros(num_envs, 3)), ray_hits_w=proxy(torch.zeros(num_envs, 187, 3)))
     )
-    env._terrain = SimpleNamespace(env_origins=torch.zeros(num_envs, 3), terrain_levels=torch.zeros(num_envs))
+    env._terrain = Terrain(env.cfg.scene.terrain, num_envs)
     env._commands = torch.tensor([0.5, 0.0, 0.0]).repeat(num_envs, 1)
     env._target_heading = torch.zeros(num_envs)
     env._command_time_left = torch.zeros(num_envs)

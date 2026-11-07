@@ -82,6 +82,17 @@ class RewardsCfg:
     # Retained only for the environment's landing statistics; they do not affect rewards.
     stage1_min_air_time = 0.12  # [s], reject contact chatter
     stage1_max_air_time = 0.60  # [s], reject prolonged one-legged balancing
+
+    # Uphill/downhill motion is necessary on rough terrain. Raw terms remain unchanged.
+    stage1_rough_weight_overrides: dict[str, float] = {"lin_vel_z_l2": 0.0}
+
+    def stage1_weight(self, name: str, terrain_mode: str) -> float | None:
+        """Resolve the effective weight without mutating the configured plane weights."""
+        weight = self.stage1_weights.get(name)
+        if weight is not None and terrain_mode == "rough":
+            return self.stage1_rough_weight_overrides.get(name, weight)
+        return weight
+
     # ==================== TODO: END ====================
 
 

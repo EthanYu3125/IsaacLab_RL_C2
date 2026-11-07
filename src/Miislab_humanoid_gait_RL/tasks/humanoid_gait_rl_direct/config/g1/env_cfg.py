@@ -146,8 +146,10 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     play_lin_vel_x = 1.0  # [m/s], fixed forward command in play mode
     is_play = False
 
+    # Terrain and objective are independent. Stage 1 selects the straight-distance objective.
+    terrain_mode = "rough"  # "rough" or "plane"
     # Stage 1 commands are identical during training and play.
-    stage1 = False
+    stage1 = True
     stage1_lin_vel_x = 0.5  # [m/s]
     stage1_heading_control_stiffness = 1.0
     stage1_max_yaw_rate = 0.5  # [rad/s], corrective turns only
@@ -158,7 +160,7 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     stage1_metrics_warmup_s = 2.0  # exclude startup from steady-walking metrics
 
     # reset: random x/y offset, fixed default robot heading (+X)
-    reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)}
+    reset_pose_range = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)}
 
     # termination: torso contact force above this is a fall [N]
     torso_contact_threshold = 1.0
@@ -179,19 +181,41 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         self.is_play = True
         self.terrain_curriculum = False
         self.scene.terrain.max_init_terrain_level = None
-        if not self.stage1 and self.scene.terrain.terrain_generator is not None:
+        if self.terrain_mode == "rough" and self.scene.terrain.terrain_generator is not None:
             self.scene.terrain.terrain_generator.num_rows = 5
-            self.scene.terrain.terrain_generator.num_cols = 5
-            self.scene.terrain.terrain_generator.curriculum = False
+            self.scene.terrain.terrain_generator.num_cols = 20
+            # Keep the type/difficulty layout; only episode-driven level updates are disabled.
+            self.scene.terrain.terrain_generator.curriculum = True
 
     def configure_stage1(self) -> None:
-        """Apply the mode after CLI overrides, immediately before constructing the scene.
-
-        Keep __post_init__ mode-neutral so a late ``env.stage1=False`` override
-        retains the original generator and curriculum. Mode changes require a new environment.
-        """
+        """Apply independent terrain/objective choices after CLI overrides, before scene construction."""
+        if self.terrain_mode not in ("rough", "plane"):
+            raise ValueError("terrain_mode must be 'rough' or 'plane'")
         if not math.isfinite(self.stage1_max_lateral_deviation) or self.stage1_max_lateral_deviation <= 0.0:
             raise ValueError("stage1_max_lateral_deviation must be finite and positive")
+        if self.terrain_mode == "plane":
+            self.scene.terrain = replace(
+                self.scene.terrain,
+                terrain_type="plane",
+                terrain_generator=None,
+                max_init_terrain_level=None,
+                env_spacing=self.scene.env_spacing,
+            )
+            self.terrain_curriculum = False
+        else:
+            generator = self.scene.terrain.terrain_generator
+            if generator is None:
+                raise ValueError("rough terrain requires a terrain_generator; use a fresh configuration")
+            self.scene.terrain = replace(
+                self.scene.terrain,
+                terrain_type="generator",
+                terrain_generator=replace(generator, curriculum=True),
+            )
+            if self.is_play:
+                self.terrain_curriculum = False
+                self.scene.terrain.max_init_terrain_level = None
+                self.scene.terrain.terrain_generator.num_rows = 5
+                self.scene.terrain.terrain_generator.num_cols = 20
         if not self.stage1:
             return
         positive = {
@@ -210,12 +234,4 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         if not 0.0 < self.rewards.stage1_min_air_time < self.rewards.stage1_max_air_time:
             raise ValueError("Stage 1 air-time bounds must satisfy 0 < min < max")
 
-        self.scene.terrain = replace(
-            self.scene.terrain,
-            terrain_type="plane",
-            terrain_generator=None,
-            max_init_terrain_level=None,
-            env_spacing=self.scene.env_spacing,
-        )
         self.scene.contact_forces.force_threshold = self.rewards.feet_contact_force_threshold
-        self.terrain_curriculum = False

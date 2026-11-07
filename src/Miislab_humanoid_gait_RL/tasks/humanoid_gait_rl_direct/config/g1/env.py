@@ -82,6 +82,9 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._reset_line_heading = torch.zeros(self.num_envs, device=self.device)
         self._lateral_out_of_bounds = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._torso_contact_termination = torch.zeros_like(self._lateral_out_of_bounds)
+        self._height_sample_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._invalid_height_ray_sum = torch.zeros(self.num_envs, device=self.device)
+        self._missing_local_height_sum = torch.zeros(self.num_envs, device=self.device)
 
     def _init_stage1_buffers(self) -> None:
         """Allocate per-environment state; these buffers never enter the policy observation."""
@@ -143,14 +146,31 @@ class HumanoidGaitRlEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         self._robot.set_joint_position_target_index(target=self._processed_actions)
 
+    def _height_measurements(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return finite observations, nearest local ground z, its validity, and invalid-ray fractions.
+
+        The scanner's pos_w is its attachment position; the 20 m offset is baked into ray starts.
+        Keep all sensor tensors read-only. A missing local hit must not become a false low-height fall.
+        """
+        hits = self._height_scanner.data.ray_hits_w.torch
+        scan_z = self._height_scanner.data.pos_w.torch[:, 2]
+        finite_hits = torch.isfinite(hits).all(dim=-1)
+        valid_scan = finite_hits & torch.isfinite(scan_z).unsqueeze(1)
+        raw_scan = scan_z.unsqueeze(1) - hits[..., 2] - 0.5
+        height_scan = torch.where(valid_scan, raw_scan, -1.0).clamp(-1.0, 1.0)
+        root_xy = self._robot.data.root_pos_w.torch[:, :2]
+        distance_sq = (hits[..., :2] - root_xy.unsqueeze(1)).square().sum(dim=-1)
+        distance_sq = torch.where(finite_hits & torch.isfinite(distance_sq), distance_sq, torch.inf)
+        nearest_distance, nearest_index = distance_sq.min(dim=1)
+        local_valid = nearest_distance.sqrt() <= 0.2
+        nearest_z = hits[..., 2].gather(1, nearest_index.unsqueeze(1)).squeeze(1)
+        ground_z = torch.where(local_valid, nearest_z, 0.0)
+        return height_scan, ground_z, local_valid, (~valid_scan).float().mean(dim=1)
+
     def _get_observations(self) -> dict:
         self._previous_actions = self._actions.clone()
         data = self._robot.data
-        height_scan = (
-            self._height_scanner.data.pos_w.torch[:, 2].unsqueeze(1)
-            - self._height_scanner.data.ray_hits_w.torch[..., 2]
-            - 0.5
-        ).clip(-1.0, 1.0)
+        height_scan, _, _, _ = self._height_measurements()
         obs = torch.cat(
             (
                 data.root_com_lin_vel_b.torch,  # 3
@@ -172,7 +192,9 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         reward = torch.zeros(self.num_envs, device=self.device)
         for name, value in compute_rewards(self, self.cfg.rewards).items():
             weight = (
-                self.cfg.rewards.stage1_weights.get(name) if self.cfg.stage1 else getattr(self.cfg.rewards, name, None)
+                self.cfg.rewards.stage1_weight(name, self.cfg.terrain_mode)
+                if self.cfg.stage1
+                else getattr(self.cfg.rewards, name, None)
             )
             if weight is None:
                 location = "RewardsCfg.stage1_weights" if self.cfg.stage1 else "RewardsCfg"
@@ -188,8 +210,13 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         vel_yaw = quat_apply_inverse(yaw_quat(data.root_quat_w.torch), data.root_lin_vel_w.torch[:, :3])
         self._error_vel_xy_sum += torch.linalg.norm(self._commands[:, :2] - vel_yaw[:, :2], dim=1)
         self._error_vel_yaw_sum += torch.abs(self._commands[:, 2] - data.root_ang_vel_w.torch[:, 2])
+        _, _, local_valid, invalid_rays = self._height_measurements()
+        self._height_sample_steps += 1
+        self._invalid_height_ray_sum += invalid_rays
+        if self.cfg.terrain_mode == "rough":
+            self._missing_local_height_sum += (~local_valid).float()
         if self.cfg.stage1:
-            self._accumulate_stage1_metrics(vel_yaw)
+            self._accumulate_stage1_metrics()
             # Update history only after the reward has compared this event with the previous landing.
             self._stage1_last_touchdown[valid_touchdown] = touchdown_foot[valid_touchdown]
         return reward
@@ -215,7 +242,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         )
         return foot, valid
 
-    def _accumulate_stage1_metrics(self, vel_yaw: torch.Tensor) -> None:
+    def _accumulate_stage1_metrics(self) -> None:
         """Track full-episode metrics and a second set excluding the first two seconds."""
         data = self._robot.data
         offset = data.root_pos_w.torch[:, :2] - self._stage1_start_pos[:, :2]
@@ -223,7 +250,8 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         in_contact = self._contact_sensor.data.current_contact_time.torch[:, self._feet_sensor_ids] > 0.0
         feet_speed = data.body_lin_vel_w.torch[:, self._feet_body_ids, :2].norm(dim=-1)
         values = {
-            "forward_speed": vel_yaw[:, 0],
+            "forward_speed": heading.cos() * data.root_lin_vel_w.torch[:, 0]
+            + heading.sin() * data.root_lin_vel_w.torch[:, 1],
             "lateral_deviation": (-heading.sin() * offset[:, 0] + heading.cos() * offset[:, 1]).abs(),
             "heading_error": wrap_to_pi(heading - data.heading_w.torch).abs(),
             "foot_slide_speed": (feet_speed * in_contact).sum(dim=1) / in_contact.sum(dim=1).clamp_min(1),
@@ -262,12 +290,39 @@ class HumanoidGaitRlEnv(DirectRLEnv):
             logs["Episode_Termination/" + name] = torch.count_nonzero(value[ids])
         for name, value in self._stage1_metric_sums.items():
             logs["Metrics/stage1_" + name] = (value[ids] / steps).mean()
+        if self.cfg.terrain_mode == "rough":
+            logs.update(self._terrain_episode_logs(ids, forward_displacement))
         steady_ids = ids[self._stage1_steady_steps[ids] > 0]
         if len(steady_ids) > 0:
             for name, value in self._stage1_steady_metric_sums.items():
                 logs["Metrics/stage1_steady_" + name] = (
                     value[steady_ids] / self._stage1_steady_steps[steady_ids]
                 ).mean()
+        return logs
+
+    def _terrain_episode_logs(self, ids: torch.Tensor, displacement: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Group finished episodes by sub-terrain, before the curriculum changes their origins/levels."""
+        generator = self.cfg.scene.terrain.terrain_generator
+        # Mirror TerrainGenerator's sorted-column assignment (including its boundary epsilon).
+        column_fraction = self._terrain.terrain_types[ids].double() / generator.num_cols + 0.001
+        total = sum(sub.proportion for sub in generator.sub_terrains.values())
+        lower, logs = 0.0, {}
+        for name, sub in generator.sub_terrains.items():
+            upper = lower + sub.proportion / total
+            selected = (column_fraction >= lower) & (column_fraction < upper)
+            lower = upper
+            if not selected.any():
+                continue
+            group = ids[selected]
+            steps = self._stage1_episode_steps[group].float()
+            prefix = f"Terrain/{name}/"
+            logs[prefix + "episodes"] = selected.sum()
+            logs[prefix + "forward_displacement"] = displacement[selected].mean()
+            logs[prefix + "length_s"] = (steps * self.step_dt).mean()
+            logs[prefix + "lateral_deviation"] = (self._stage1_metric_sums["lateral_deviation"][group] / steps).mean()
+            logs[prefix + "max_lateral_deviation"] = self._stage1_max_lateral_deviation[group].mean()
+            logs[prefix + "failure_rate"] = self.reset_terminated[group].float().mean()
+            logs[prefix + "terrain_level"] = self._terrain.terrain_levels[group].float().mean()
         return logs
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -287,9 +342,14 @@ class HumanoidGaitRlEnv(DirectRLEnv):
             lateral_offset.abs() > self.cfg.stage1_max_lateral_deviation
         ) & self.cfg.stage1_enable_lateral_termination
         if self.cfg.stage1:
-            height = data.root_pos_w.torch[:, 2] - self._terrain.env_origins[:, 2]
             tilted = -data.projected_gravity_b.torch[:, 2] < math.cos(math.radians(self.cfg.stage1_max_tilt_deg))
-            low = height < self._stage1_target_height * self.cfg.stage1_min_height_ratio
+            if self.cfg.terrain_mode == "rough":
+                _, ground_z, local_valid, _ = self._height_measurements()
+                height = data.root_pos_w.torch[:, 2] - ground_z
+                low = local_valid & (height < self._stage1_target_height * self.cfg.stage1_min_height_ratio)
+            else:
+                height = data.root_pos_w.torch[:, 2] - self._terrain.env_origins[:, 2]
+                low = height < self._stage1_target_height * self.cfg.stage1_min_height_ratio
             self._stage1_termination_causes["torso_contact"][:] = died
             self._stage1_termination_causes["excessive_tilt"][:] = tilted
             self._stage1_termination_causes["low_height"][:] = low
@@ -306,6 +366,19 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         stage1_logs = self._stage1_episode_logs(env_ids) if self.cfg.stage1 else {}
         torso_failures = torch.count_nonzero(self._torso_contact_termination[env_ids])
         lateral_failures = torch.count_nonzero(self._lateral_out_of_bounds[env_ids])
+        terrain_level = (
+            self._terrain.terrain_levels[env_ids].float().mean()
+            if self.cfg.terrain_mode == "rough"
+            else torch.zeros((), device=self.device)
+        )
+        sampled_ids = env_ids[self._height_sample_steps[env_ids] > 0]
+        height_logs = {}
+        if len(sampled_ids) > 0:
+            samples = self._height_sample_steps[sampled_ids].float()
+            height_logs = {
+                "Metrics/invalid_height_ray_fraction": (self._invalid_height_ray_sum[sampled_ids] / samples).mean(),
+                "Metrics/missing_local_height_fraction": (self._missing_local_height_sum[sampled_ids] / samples).mean(),
+            }
         if self.cfg.terrain_curriculum:
             self._update_terrain_curriculum(env_ids)
         self._robot.reset(env_ids)
@@ -353,10 +426,9 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         extras["Episode_Termination/time_out"] = torch.count_nonzero(completed)
         extras["Metrics/error_vel_xy"] = torch.mean(self._error_vel_xy_sum[env_ids] / episode_steps)
         extras["Metrics/error_vel_yaw"] = torch.mean(self._error_vel_yaw_sum[env_ids] / episode_steps)
-        extras["Metrics/terrain_level"] = (
-            torch.zeros((), device=self.device) if self.cfg.stage1 else torch.mean(self._terrain.terrain_levels.float())
-        )
+        extras["Metrics/terrain_level"] = terrain_level
         extras.update(stage1_logs)
+        extras.update(height_logs)
         index_fill_(self._error_vel_xy_sum, env_ids, 0.0)
         index_fill_(self._error_vel_yaw_sum, env_ids, 0.0)
         self.extras["log"] = extras
@@ -367,6 +439,9 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._reset_line_heading[env_ids] = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
         self._lateral_out_of_bounds[env_ids] = False
         self._torso_contact_termination[env_ids] = False
+        self._height_sample_steps[env_ids] = 0
+        self._invalid_height_ray_sum[env_ids] = 0.0
+        self._missing_local_height_sum[env_ids] = 0.0
 
     def _reset_stage1_state(self, env_ids: torch.Tensor, root_pose: torch.Tensor) -> None:
         """Capture the composed reset quaternion directly, without reading a stale simulator pose."""
@@ -386,6 +461,25 @@ class HumanoidGaitRlEnv(DirectRLEnv):
 
     def _update_terrain_curriculum(self, env_ids: torch.Tensor):
         """Move robots that crossed their terrain tile to harder terrain, and those that barely moved to easier."""
+        if self.cfg.terrain_mode != "rough" or not self.cfg.terrain_curriculum or self.cfg.is_play:
+            return
+        if self.cfg.stage1:
+            # Only completed episodes count; explicit/manual resets and initial setup do not change difficulty.
+            finished = (self.reset_terminated[env_ids] | self.reset_time_outs[env_ids]) & (
+                self._stage1_episode_steps[env_ids] > 0
+            )
+            env_ids = env_ids[finished]
+            if len(env_ids) == 0:
+                return
+            offset = self._robot.data.root_pos_w.torch[env_ids, :2] - self._stage1_start_pos[env_ids, :2]
+            heading = self._target_heading[env_ids]
+            distance = heading.cos() * offset[:, 0] + heading.sin() * offset[:, 1]
+            failed = self.reset_terminated[env_ids]
+            completed = self.reset_time_outs[env_ids] & ~failed
+            move_up = completed & (distance > 4.0)
+            move_down = failed | (completed & (distance < 2.0))
+            self._terrain.update_env_origins(env_ids, move_up, move_down)
+            return
         # skip envs that have not run an episode yet (e.g. the initial reset)
         env_ids = env_ids[self.episode_length_buf[env_ids] > 0]
         if len(env_ids) == 0:

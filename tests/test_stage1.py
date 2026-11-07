@@ -41,7 +41,10 @@ def tensors_in(value, prefix=""):
 
 
 def total_reward(env, terms):
-    return sum(env.cfg.rewards.stage1_weights[name] * term for name, term in terms.items()) * env.step_dt
+    return (
+        sum(env.cfg.rewards.stage1_weight(name, env.cfg.terrain_mode) * term for name, term in terms.items())
+        * env.step_dt
+    )
 
 
 def set_landing(env, foot, air_time=0.25, other_support=True):
@@ -55,8 +58,9 @@ def set_landing(env, foot, air_time=0.25, other_support=True):
 
 
 @pytest.mark.parametrize("num_envs", [1, 4, 64])
-def test_reward_contract_and_input_immutability(modules, num_envs):
-    env = make_env(modules, num_envs=num_envs)
+@pytest.mark.parametrize("terrain_mode", ["plane", "rough"])
+def test_reward_contract_and_input_immutability(modules, num_envs, terrain_mode):
+    env = make_env(modules, num_envs=num_envs, terrain_mode=terrain_mode)
     before = tensors_in(env)
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
     assert len(terms) == 21
@@ -404,6 +408,7 @@ def test_observation_and_action_contract(env):
 def test_mode_applied_after_overrides_and_flat_play_is_safe(modules, play_before):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
     cfg.stage1 = True
+    cfg.terrain_mode = "plane"
     assert cfg.scene.terrain.terrain_type == "generator"  # not prematurely converted in __post_init__
     if play_before:
         cfg.play_mode()
@@ -442,8 +447,9 @@ def test_weight_overrides_and_missing_weight(env):
         env._get_rewards()
 
 
-def test_original_reward_values_are_preserved(modules):
-    env = make_env(modules, num_envs=1, stage1=False)
+@pytest.mark.parametrize("terrain_mode", ["plane", "rough"])
+def test_original_reward_values_are_preserved(modules, terrain_mode):
+    env = make_env(modules, num_envs=1, stage1=False, terrain_mode=terrain_mode)
     data, contact = env._robot.data, env._contact_sensor.data
     data.root_lin_vel_w.torch[:] = torch.tensor([0.1, 0.2, 0.0])
     data.root_ang_vel_w.torch[:, 2] = 0.3
