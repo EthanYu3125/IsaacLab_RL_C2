@@ -35,20 +35,20 @@ class RewardsCfg:
     termination = -200.0  # 懲罰非預期終止
     track_lin_vel_xy_exp = 1.0  # 鼓勵追蹤平面線速度指令
     track_ang_vel_z_exp = 2.0  # 鼓勵追蹤繞垂直軸的角速度指令
-    ang_vel_xy_l2 = -0.05  # 懲罰機身在水平軸上的角速度
+    ang_vel_xy_l2 = -0.1  # 懲罰機身在水平軸上的角速度
     flat_orientation_l2 = -1.0  # 懲罰機身偏離水平姿態
-    dof_torques_l2 = -1.5e-7  # 懲罰腿部關節施力過大
-    dof_acc_l2 = -1.25e-7  # 懲罰腿部關節加速度過大
-    action_rate_l2 = -0.005  # 懲罰相鄰控制步驟的動作變化過大
+    dof_torques_l2 = -1.0e-5  # 懲罰腿部關節施力過大
+    dof_acc_l2 = -1.0e-5  # 懲罰腿部關節加速度過大
+    action_rate_l2 = -0.01  # 懲罰相鄰控制步驟的動作變化過大
     dof_pos_limits = -1.0  # 懲罰踝關節超出軟性位置限制
-    joint_deviation_hip = -0.1  # 懲罰髖關節偏離預設姿勢
-    joint_deviation_arms = -0.1  # 懲罰手臂關節偏離預設姿勢
+    joint_deviation_hip = -0.01  # 懲罰髖關節偏離預設姿勢
+    joint_deviation_arms = -0.01  # 懲罰手臂關節偏離預設姿勢
     joint_deviation_fingers = -0.05  # 懲罰手指關節偏離預設姿勢
-    joint_deviation_torso = -0.1  # 懲罰軀幹關節偏離預設姿勢
+    joint_deviation_torso = -0.01  # 懲罰軀幹關節偏離預設姿勢
     feet_air_time = 0.25  # 鼓勵單腳支撐時維持適當時間
-    feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
-    feet_contact_rhythm = 0.3  # 鼓勵目前觸地時間接近上次觸地時間
-    feet_force_symmetry = 0.15  # 鼓勵雙腳支撐時左右受力對稱
+    feet_slide = -0.2  # 懲罰腳掌接觸地面時滑動
+    feet_contact_rhythm = 1.0  # 鼓勵目前觸地時間接近上次觸地時間
+    feet_force_symmetry = 0.7  # 鼓勵雙腳支撐時左右受力對稱
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
@@ -57,7 +57,7 @@ class RewardsCfg:
     feet_contact_rhythm_std = 0.1  # [s], contact-time difference at which the reward drops to exp(-1)
     feet_contact_force_threshold = 1.0  # [N], a foot pushing harder than this counts as touching the ground
     feet_force_symmetry_std = 0.25  # relative force imbalance at which the symmetry reward drops to exp(-1)
-    feet_force_symmetry_max_total_contact_time = 0.6  # [s], max combined foot contact duration
+    feet_force_symmetry_max_total_contact_time = 0.3  # [s], max combined foot contact duration
     # ==================== TODO: END ====================
 
 
