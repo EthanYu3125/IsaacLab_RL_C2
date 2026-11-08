@@ -33,13 +33,13 @@ class RewardsCfg:
     # ==================== TODO: EDIT BELOW (reward weights and parameters) ====================
     # 權重為正表示鼓勵該行為，為負表示懲罰該行為，設為 0 則停用該項
     termination = -200.0  # 懲罰非預期終止
-    track_lin_vel_xy_exp = 1.0  # 鼓勵追蹤平面線速度指令
+    track_lin_vel_xy_exp = 2.0  # 鼓勵追蹤平面線速度指令
     track_ang_vel_z_exp = 2.0  # 鼓勵追蹤繞垂直軸的角速度指令
     ang_vel_xy_l2 = -0.1  # 懲罰機身在水平軸上的角速度
     flat_orientation_l2 = -1.0  # 懲罰機身偏離水平姿態
-    dof_torques_l2 = -1.0e-5  # 懲罰腿部關節施力過大
-    dof_acc_l2 = -1.0e-5  # 懲罰腿部關節加速度過大
-    action_rate_l2 = -0.01  # 懲罰相鄰控制步驟的動作變化過大
+    dof_torques_l2 = -5.0e-7  # 懲罰腿部關節施力過大
+    dof_acc_l2 = -5.0e-7  # 懲罰腿部關節加速度過大
+    action_rate_l2 = -0.05  # 懲罰相鄰控制步驟的動作變化過大
     dof_pos_limits = -1.0  # 懲罰踝關節超出軟性位置限制
     joint_deviation_hip = -0.01  # 懲罰髖關節偏離預設姿勢
     joint_deviation_arms = -0.01  # 懲罰手臂關節偏離預設姿勢
