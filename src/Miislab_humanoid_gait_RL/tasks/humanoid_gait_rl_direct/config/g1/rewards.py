@@ -33,7 +33,7 @@ class RewardsCfg:
     # ==================== TODO: EDIT BELOW (reward weights and parameters) ====================
     # 權重為正表示鼓勵該行為，為負表示懲罰該行為，設為 0 則停用該項
     termination = -200.0  # 懲罰非預期終止
-    track_lin_vel_xy_exp = 1.0  # 鼓勵追蹤平面線速度指令
+    track_lin_vel_xy_exp = 1.5  # 鼓勵追蹤平面線速度指令
     track_ang_vel_z_exp = 2.0  # 鼓勵追蹤繞垂直軸的角速度指令
     ang_vel_xy_l2 = -0.05  # 懲罰機身在水平軸上的角速度
     flat_orientation_l2 = -1.0  # 懲罰機身偏離水平姿態
