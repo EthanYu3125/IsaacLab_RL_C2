@@ -47,7 +47,7 @@ class RewardsCfg:
     joint_deviation_torso = -0.1  # 懲罰軀幹關節偏離預設姿勢
     feet_air_time = 0.4  # 鼓勵單腳支撐時維持適當時間
     feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
-    feet_lift = 0.5  # 鼓勵離地且抬高超過目標高度
+    feet_lift = 0.3  # 鼓勵離地且抬高超過目標高度
     feet_contact_rhythm = 0.5  # 鼓勵目前觸地時間接近上次觸地時間
     feet_force_symmetry = 0.15  # 鼓勵雙腳支撐時左右受力對稱
 
