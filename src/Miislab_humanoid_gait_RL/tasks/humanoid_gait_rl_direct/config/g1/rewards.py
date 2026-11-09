@@ -47,12 +47,14 @@ class RewardsCfg:
     joint_deviation_torso = -0.1  # 懲罰軀幹關節偏離預設姿勢
     feet_air_time = 0.4  # 鼓勵單腳支撐時維持適當時間
     feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
+    feet_lift = 0.5  # 鼓勵離地且抬高超過目標高度
     feet_contact_rhythm = 0.5  # 鼓勵目前觸地時間接近上次觸地時間
     feet_force_symmetry = 0.15  # 鼓勵雙腳支撐時左右受力對稱
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
     feet_air_time_max = 0.4  # [s], single-stance time rewarded per step
+    feet_lift_target_height = 0.12  # [m], foot height above the terrain origin required for a lift reward
     feet_contact_rhythm_min_time = 0.1  # [s], ignore short contacts and taps
     feet_contact_rhythm_std = 0.05  # [s], contact-time difference at which the reward drops to exp(-1)
     feet_contact_force_threshold = 30.0  # [N], a foot pushing harder than this counts as touching the ground
@@ -124,6 +126,8 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     feet_forces = contact.net_normal_forces_w_history.torch[:, :, env._feet_sensor_ids]
     feet_force_magnitudes = feet_forces.norm(dim=-1)
     feet_contact = feet_force_magnitudes.max(dim=1)[0] > cfg.feet_contact_force_threshold
+    feet_height = data.body_pos_w.torch[:, env._feet_body_ids, 2] - env._terrain.env_origins[:, 2].unsqueeze(-1)
+    feet_lift = torch.sum((~feet_contact) & (feet_height > cfg.feet_lift_target_height), dim=1).float()
 
     # compare left/right normal forces only during bilateral support
     bilateral_contact = (feet_force_magnitudes > cfg.feet_contact_force_threshold).all(dim=-1)
@@ -157,6 +161,7 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         "joint_deviation_fingers": joint_deviation(env._finger_joint_ids),
         "joint_deviation_torso": joint_deviation(env._torso_joint_ids),
         "feet_air_time": feet_air_time,
+        "feet_lift": feet_lift,
         "feet_contact_rhythm": feet_contact_rhythm,
         "feet_force_symmetry": feet_force_symmetry,
         "feet_slide": feet_slide,
