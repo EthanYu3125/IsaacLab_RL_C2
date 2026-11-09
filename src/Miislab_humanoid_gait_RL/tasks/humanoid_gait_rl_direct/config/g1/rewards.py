@@ -33,12 +33,12 @@ class RewardsCfg:
     # ==================== TODO: EDIT BELOW (reward weights and parameters) ====================
     # 權重為正表示鼓勵該行為，為負表示懲罰該行為，設為 0 則停用該項
     termination = -200.0  # 懲罰非預期終止
-    track_lin_vel_xy_exp = 5.0  # 鼓勵追蹤平面線速度指令
+    track_lin_vel_xy_exp = 2.0  # 鼓勵追蹤平面線速度指令
     track_ang_vel_z_exp = 2.0  # 鼓勵追蹤繞垂直軸的角速度指令
     ang_vel_xy_l2 = -0.05  # 懲罰機身在水平軸上的角速度
     flat_orientation_l2 = -1.0  # 懲罰機身偏離水平姿態
-    dof_torques_l2 = -1.5e-7  # 懲罰腿部關節施力過大
-    dof_acc_l2 = -1.25e-7  # 懲罰腿部關節加速度過大
+    dof_torques_l2 = -0.5e-7  # 懲罰腿部關節施力過大
+    dof_acc_l2 = -0.25e-7  # 懲罰腿部關節加速度過大
     action_rate_l2 = -0.005  # 懲罰相鄰控制步驟的動作變化過大
     dof_pos_limits = -1.0  # 懲罰踝關節超出軟性位置限制
     joint_deviation_hip = -0.01  # 懲罰髖關節偏離預設姿勢
@@ -53,11 +53,11 @@ class RewardsCfg:
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
     feet_air_time_max = 0.4  # [s], single-stance time rewarded per step
-    feet_contact_rhythm_min_time = 0.2  # [s], ignore short contacts and taps
-    feet_contact_rhythm_std = 0.1  # [s], contact-time difference at which the reward drops to exp(-1)
-    feet_contact_force_threshold = 1.0  # [N], a foot pushing harder than this counts as touching the ground
+    feet_contact_rhythm_min_time = 0.1  # [s], ignore short contacts and taps
+    feet_contact_rhythm_std = 0.05  # [s], contact-time difference at which the reward drops to exp(-1)
+    feet_contact_force_threshold = 30.0  # [N], a foot pushing harder than this counts as touching the ground
     feet_force_symmetry_std = 0.25  # relative force imbalance at which the symmetry reward drops to exp(-1)
-    feet_force_symmetry_max_total_contact_time = 0.4  # [s], max combined foot contact duration
+    feet_force_symmetry_max_total_contact_time = 0.25  # [s], max combined foot contact duration
     # ==================== TODO: END ====================
 
 
