@@ -33,6 +33,13 @@ from isaaclab_tasks.utils import PresetCfg
 
 from isaaclab_assets import G1_MINIMAL_CFG
 
+from Miislab_humanoid_gait_RL.assets.race_track import (
+    RACE_TRACK_LENGTH,
+    RACE_TRACK_WIDTH,
+    TrackSpec,
+    ensure_track_asset,
+)
+
 from .rewards import RewardsCfg
 
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
@@ -99,6 +106,8 @@ class HumanoidGaitRlSceneCfg(InteractiveSceneCfg):
         global_world_only=True,
     )
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    race_track: AssetBaseCfg | None = None
+    torso_ground_contact: ContactSensorCfg | None = None
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
         spawn=sim_utils.DomeLightCfg(
@@ -147,7 +156,10 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     is_play = False
 
     # Terrain and objective are independent. Stage 1 selects the straight-distance objective.
-    terrain_mode = "rough"  # "rough" or "plane"
+    terrain_mode = "race"  # "race", "rough" or "plane"; stage1 only selects the objective in legacy modes
+    race_track_length = RACE_TRACK_LENGTH
+    race_track_width = RACE_TRACK_WIDTH
+    race_episode_length_s = 90.0
     # Stage 1 commands are identical during training and play.
     stage1 = True
     stage1_lin_vel_x = 0.5  # [m/s]
@@ -189,8 +201,11 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
 
     def configure_stage1(self) -> None:
         """Apply independent terrain/objective choices after CLI overrides, before scene construction."""
+        if self.terrain_mode == "race":
+            self._configure_race()
+            return
         if self.terrain_mode not in ("rough", "plane"):
-            raise ValueError("terrain_mode must be 'rough' or 'plane'")
+            raise ValueError("terrain_mode must be 'race', 'rough' or 'plane'")
         if not math.isfinite(self.stage1_max_lateral_deviation) or self.stage1_max_lateral_deviation <= 0.0:
             raise ValueError("stage1_max_lateral_deviation must be finite and positive")
         if self.terrain_mode == "plane":
@@ -235,3 +250,49 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
             raise ValueError("Stage 1 air-time bounds must satisfy 0 < min < max")
 
         self.scene.contact_forces.force_threshold = self.rewards.feet_contact_force_threshold
+
+    def _configure_race(self) -> None:
+        """Create lane assets after overrides, but before DirectRLEnv creates physics and the scene."""
+        spec = TrackSpec(self.race_track_length, self.race_track_width)
+        for name, value in (
+            ("race_episode_length_s", self.race_episode_length_s),
+            ("tracking_std", self.rewards.tracking_std),
+            ("stage1_lin_vel_x", self.stage1_lin_vel_x),
+            ("stage1_max_yaw_rate", self.stage1_max_yaw_rate),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 0 < self.stage1_min_height_ratio < 1 or not 0 < self.stage1_max_tilt_deg < 180:
+            raise ValueError("Race fall limits require 0 < height ratio < 1 and 0 < tilt < 180")
+
+        # The CLI normally resolves presets first. Also support direct gym.make(cfg=...) callers.
+        physics = self.sim.physics
+        if isinstance(physics, HumanoidGaitRlPhysicsCfg):
+            physics = physics.default
+        if not isinstance(physics, NewtonCfg) or not isinstance(physics.solver_cfg, MJWarpSolverCfg):
+            raise ValueError("Race mode requires Newton MJWarp for ground-only shape contact filtering")
+        self.sim.physics = replace(physics, solver_cfg=replace(physics.solver_cfg, use_mujoco_contacts=True))
+
+        self.episode_length_s = self.race_episode_length_s
+        self.terrain_curriculum = False
+        self.scene.env_spacing = spec.env_spacing
+        self.scene.terrain = replace(
+            self.scene.terrain,
+            terrain_type="plane",
+            terrain_generator=None,
+            max_init_terrain_level=None,
+            env_spacing=spec.env_spacing,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.32, 0.52, 0.30)),
+        )
+        self.scene.race_track = AssetBaseCfg(
+            prim_path="{ENV_REGEX_NS}/RaceTrack",
+            spawn=sim_utils.UsdFileCfg(usd_path=str(ensure_track_asset(spec))),
+        )
+        # Shape filtering includes only the global ground, never the per-environment fences.
+        self.scene.torso_ground_contact = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+            filter_shape_prim_expr=["/World/ground/terrain/.*"],
+            history_length=3,
+        )
+        self.scene.contact_forces.force_threshold = self.rewards.feet_contact_force_threshold
+        self.scene.sky_light = replace(self.scene.sky_light, spawn=sim_utils.DomeLightCfg(intensity=1000.0))

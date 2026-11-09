@@ -90,6 +90,7 @@ class BaseEnv:
 
 def load_task_modules(monkeypatch):
     """Temporarily supply external boundaries, importing the actual task source files."""
+    monkeypatch.syspath_prepend(str(TASK_DIR.parents[4]))
 
     def module(name, **attributes):
         result = types.ModuleType(name)
@@ -102,7 +103,15 @@ def load_task_modules(monkeypatch):
 
     module("warp", to_torch=lambda x: x)
     module("isaaclab")
-    module("isaaclab.sim", RigidBodyMaterialCfg=Config, MdlFileCfg=Config, DomeLightCfg=Config, SimulationCfg=Config)
+    module(
+        "isaaclab.sim",
+        RigidBodyMaterialCfg=Config,
+        MdlFileCfg=Config,
+        DomeLightCfg=Config,
+        SimulationCfg=Config,
+        PreviewSurfaceCfg=Config,
+        UsdFileCfg=Config,
+    )
     module("isaaclab.assets", ArticulationCfg=Config, AssetBaseCfg=Config)
     module("isaaclab.envs", DirectRLEnv=BaseEnv, DirectRLEnvCfg=Config)
     module("isaaclab.physics", PhysxAutoCfg=Config)
@@ -172,7 +181,7 @@ def load_task_modules(monkeypatch):
     module("isaaclab_assets", G1_MINIMAL_CFG=Config())
     module("_stage1_unit_task", __path__=[str(TASK_DIR)])
     loaded = {}
-    for name in ("rewards", "env_cfg", "env"):
+    for name in ("rewards", "env_cfg", "race", "env"):
         full_name = f"_stage1_unit_task.{name}"
         # Register removal before import, so fixture teardown cannot leak fake imports to other tests.
         monkeypatch.setitem(sys.modules, full_name, None)
@@ -317,7 +326,13 @@ def make_env(modules, num_envs=4, stage1=True, terrain_mode=None):
     env._arm_joint_ids, env._finger_joint_ids, env._torso_joint_ids = list(range(13, 23)), list(range(23, 37)), [12]
     env._init_reset_line_buffers()
     env._reset_line_state(torch.arange(num_envs), env._robot.data.default_root_pose.torch.clone())
-    if stage1:
+    if terrain_mode == "race":
+        env._torso_ground_sensor = SimpleNamespace(
+            data=SimpleNamespace(normal_force_matrix_w_history=proxy(torch.zeros(num_envs, 3, 1, 1, 3)))
+        )
+        env._init_race_buffers()
+        env._reset_race_state(torch.arange(num_envs))
+    elif stage1:
         env._init_stage1_buffers()
         env._reset_stage1_state(torch.arange(num_envs), env._robot.data.default_root_pose.torch.clone())
     return env

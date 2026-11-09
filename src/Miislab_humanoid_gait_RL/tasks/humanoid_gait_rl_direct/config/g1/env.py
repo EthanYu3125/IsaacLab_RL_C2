@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import math
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,13 +18,14 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.utils import index_fill_
 from isaaclab.utils.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform, wrap_to_pi, yaw_quat
 
+from .race import RaceLifecycleMixin
 from .rewards import compute_rewards
 
 if TYPE_CHECKING:
     from .env_cfg import HumanoidGaitRlEnvCfg
 
 
-class HumanoidGaitRlEnv(DirectRLEnv):
+class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
     """Unitree G1 learning to follow a forward-velocity and heading command on rough terrain."""
 
     cfg: HumanoidGaitRlEnvCfg
@@ -73,7 +76,25 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._error_vel_yaw_sum = torch.zeros(self.num_envs, device=self.device)
 
         self._init_reset_line_buffers()
-        if self.cfg.stage1:
+        if self._race_mode:
+            self._torso_ground_sensor = self.scene["torso_ground_contact"]
+            self._init_race_buffers()
+            # Upstream dumps its config before gym.make; preserve the effective late-applied race settings too.
+            if getattr(self.cfg, "log_dir", None):
+                log_dir = Path(self.cfg.log_dir)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                settings = {
+                    "terrain_mode": "race",
+                    "race_track_length": self.cfg.race_track_length,
+                    "race_track_width": self.cfg.race_track_width,
+                    "episode_length_s": self.cfg.episode_length_s,
+                    "env_spacing": self.cfg.scene.env_spacing,
+                    "use_mujoco_contacts": self.cfg.sim.physics.solver_cfg.use_mujoco_contacts,
+                    "track_usd": self.cfg.scene.race_track.spawn.usd_path,
+                    "race_weights": self.cfg.rewards.race_weights,
+                }
+                (log_dir / "race_config.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        elif self.cfg.stage1:
             self._init_stage1_buffers()
 
     def _init_reset_line_buffers(self) -> None:
@@ -109,7 +130,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         }
 
     def _resample_commands(self, env_ids: torch.Tensor):
-        if self.cfg.stage1:
+        if self.cfg.stage1 or self._race_mode:
             # The target heading was captured from the reset pose and stays fixed for the episode.
             self._commands[env_ids, 0] = self.cfg.stage1_lin_vel_x
             self._commands[env_ids, 1] = 0.0
@@ -127,16 +148,18 @@ class HumanoidGaitRlEnv(DirectRLEnv):
 
     def _update_yaw_rate_command(self):
         heading_error = wrap_to_pi(self._target_heading - self._robot.data.heading_w.torch)
-        stiffness = self.cfg.stage1_heading_control_stiffness if self.cfg.stage1 else self.cfg.heading_control_stiffness
-        max_rate = self.cfg.stage1_max_yaw_rate if self.cfg.stage1 else 1.0
+        straight = self.cfg.stage1 or self._race_mode
+        stiffness = self.cfg.stage1_heading_control_stiffness if straight else self.cfg.heading_control_stiffness
+        max_rate = self.cfg.stage1_max_yaw_rate if straight else 1.0
         self._commands[:, 2] = torch.clamp(heading_error * stiffness, min=-max_rate, max=max_rate)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self.extras.pop("race_episode", None)
         self._actions = actions.clone()
         self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos.torch
 
         # Stage 1 holds the reset heading; the original mode periodically chooses a new target.
-        if not self.cfg.stage1:
+        if not (self.cfg.stage1 or self._race_mode):
             self._command_time_left -= self.step_dt
             resample_env_ids = (self._command_time_left <= 0.0).nonzero(as_tuple=False).flatten()
             if len(resample_env_ids) > 0:
@@ -187,17 +210,20 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        if self.cfg.stage1:
+        if self._legacy_stage1:
             touchdown_foot, valid_touchdown = self._prepare_stage1_touchdown()
         reward = torch.zeros(self.num_envs, device=self.device)
         for name, value in compute_rewards(self, self.cfg.rewards).items():
-            weight = (
-                self.cfg.rewards.stage1_weight(name, self.cfg.terrain_mode)
-                if self.cfg.stage1
-                else getattr(self.cfg.rewards, name, None)
-            )
+            if self._race_mode:
+                weight = self.cfg.rewards.race_weights.get(name)
+            elif self.cfg.stage1:
+                weight = self.cfg.rewards.stage1_weight(name, self.cfg.terrain_mode)
+            else:
+                weight = getattr(self.cfg.rewards, name, None)
             if weight is None:
                 location = "RewardsCfg.stage1_weights" if self.cfg.stage1 else "RewardsCfg"
+                if self._race_mode:
+                    location = "RewardsCfg.race_weights"
                 raise KeyError(f"Reward term '{name}' has no weight in {location} in rewards.py")
             value = value * weight * self.step_dt
             if name not in self._episode_sums:
@@ -215,7 +241,10 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         self._invalid_height_ray_sum += invalid_rays
         if self.cfg.terrain_mode == "rough":
             self._missing_local_height_sum += (~local_valid).float()
-        if self.cfg.stage1:
+        if self._race_mode:
+            self._race_previous_xy[:] = self._race_position()
+            self._race_terminal_paid |= self._race_finished | self._race_fell
+        elif self.cfg.stage1:
             self._accumulate_stage1_metrics()
             # Update history only after the reward has compared this event with the previous landing.
             self._stage1_last_touchdown[valid_touchdown] = touchdown_foot[valid_touchdown]
@@ -326,6 +355,8 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         return logs
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._race_mode:
+            return self._race_get_dones()
         time_out = self.episode_length_buf >= self.max_episode_length - (0 if self.cfg.stage1 else 1)
         # the torso touching anything counts as a fall
         torso_forces = self._contact_sensor.data.net_normal_forces_w_history.torch[:, :, self._torso_sensor_ids]
@@ -361,9 +392,10 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = wp.to_torch(self._robot._ALL_INDICES)
         # the curriculum reads how far each robot walked, so it must run before the root pose is reset
-        step_buffer = self._stage1_episode_steps if self.cfg.stage1 else self.episode_length_buf
+        step_buffer = self._stage1_episode_steps if self._legacy_stage1 else self.episode_length_buf
         episode_steps = step_buffer[env_ids].float().clamp_min(1.0)
-        stage1_logs = self._stage1_episode_logs(env_ids) if self.cfg.stage1 else {}
+        stage1_logs = self._stage1_episode_logs(env_ids) if self._legacy_stage1 else {}
+        race_logs = self._race_episode_logs(env_ids) if self._race_mode else {}
         torso_failures = torch.count_nonzero(self._torso_contact_termination[env_ids])
         lateral_failures = torch.count_nonzero(self._lateral_out_of_bounds[env_ids])
         terrain_level = (
@@ -383,7 +415,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
             self._update_terrain_curriculum(env_ids)
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
-        if len(env_ids) == self.num_envs and not self.cfg.stage1:
+        if len(env_ids) == self.num_envs and not (self.cfg.stage1 or self._race_mode):
             # spread out the resets to avoid spikes in training when many environments reset at a similar time
             self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
         index_fill_(self._actions, env_ids, 0.0)
@@ -400,6 +432,10 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         zeros = torch.zeros_like(yaw)
         root_pose[:, 3:7] = quat_mul(root_pose[:, 3:7], quat_from_euler_xyz(zeros, zeros, yaw))
         root_vel = self._robot.data.default_root_vel.torch[env_ids].clone()
+        if self._race_mode:
+            root_pose[:, :2] = self._terrain.env_origins[env_ids, :2]
+            root_pose[:, 3:7] = quat_from_euler_xyz(zeros, zeros, zeros)
+            root_vel.zero_()
         # joints: default pose at rest
         joint_pos = self._robot.data.default_joint_pos.torch[env_ids].clone()
         joint_vel = torch.zeros_like(joint_pos)
@@ -410,7 +446,9 @@ class HumanoidGaitRlEnv(DirectRLEnv):
 
         # commands depend on the new heading, so sample them after the root pose is written
         self._reset_line_state(env_ids, root_pose)
-        if self.cfg.stage1:
+        if self._race_mode:
+            self._reset_race_state(env_ids)
+        elif self.cfg.stage1:
             self._reset_stage1_state(env_ids, root_pose)
         self._resample_commands(env_ids)
 
@@ -428,6 +466,7 @@ class HumanoidGaitRlEnv(DirectRLEnv):
         extras["Metrics/error_vel_yaw"] = torch.mean(self._error_vel_yaw_sum[env_ids] / episode_steps)
         extras["Metrics/terrain_level"] = terrain_level
         extras.update(stage1_logs)
+        extras.update(race_logs)
         extras.update(height_logs)
         index_fill_(self._error_vel_xy_sum, env_ids, 0.0)
         index_fill_(self._error_vel_yaw_sum, env_ids, 0.0)

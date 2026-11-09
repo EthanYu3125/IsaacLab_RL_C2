@@ -32,7 +32,7 @@ def ground_hits(env, ground_z=0.0):
 @pytest.mark.parametrize("play_order", [None, "before", "after"])
 def test_terrain_and_objective_are_independent(modules, stage1, terrain_mode, play_order):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
-    assert cfg.stage1 and cfg.terrain_mode == "rough"
+    assert cfg.stage1 and cfg.terrain_mode == "race"
     cfg.stage1, cfg.terrain_mode = stage1, terrain_mode
     if play_order == "before":
         cfg.play_mode()
@@ -59,10 +59,12 @@ def test_terrain_and_objective_are_independent(modules, stage1, terrain_mode, pl
 
 def test_terrain_configuration_and_weights_do_not_leak(modules):
     first = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    first.terrain_mode = "rough"
     first.configure_stage1()
     first.play_mode()
     first.rewards.stage1_rough_weight_overrides["lin_vel_z_l2"] = -9.0
     second = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    second.terrain_mode = "rough"
     second.configure_stage1()
     assert second.scene.terrain.terrain_generator.num_rows == 10
     assert second.rewards.stage1_weight("lin_vel_z_l2", "rough") == 0.0

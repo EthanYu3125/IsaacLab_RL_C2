@@ -421,6 +421,7 @@ def test_mode_applied_after_overrides_and_flat_play_is_safe(modules, play_before
     assert cfg.scene.height_scanner.pattern_cfg.size == [1.6, 1.0]
     assert cfg.scene.contact_forces.force_threshold == 1.0
     rough = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    rough.terrain_mode = "rough"
     rough.stage1 = False  # emulate a late Hydra scalar override
     rough.configure_stage1()
     assert rough.scene.terrain.terrain_type == "generator"
@@ -432,6 +433,7 @@ def test_mode_applied_after_overrides_and_flat_play_is_safe(modules, play_before
 @pytest.mark.parametrize("invalid", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_tracking_scale_rejected(modules, invalid):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    cfg.terrain_mode = "plane"
     cfg.stage1 = True
     cfg.rewards.tracking_std = invalid
     with pytest.raises(ValueError, match="tracking_std"):
@@ -549,6 +551,7 @@ def test_lateral_failure_uses_reset_line_not_world_axes_or_current_heading(env, 
 @pytest.mark.parametrize("stage1", [False, True])
 def test_invalid_lateral_limit_rejected(modules, invalid, stage1):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
+    cfg.terrain_mode = "rough"
     cfg.stage1 = stage1
     cfg.stage1_max_lateral_deviation = invalid
     with pytest.raises(ValueError, match="stage1_max_lateral_deviation"):

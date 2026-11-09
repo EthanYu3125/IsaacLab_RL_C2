@@ -86,6 +86,31 @@ class RewardsCfg:
     # Uphill/downhill motion is necessary on rough terrain. Raw terms remain unchanged.
     stage1_rough_weight_overrides: dict[str, float] = {"lin_vel_z_l2": 0.0}
 
+    # Race event weights are per-event; their raw terms divide by step_dt below.
+    race_weights: dict[str, float] = {
+        "termination": -25.0,
+        "track_lin_vel_xy_exp": 0.0,
+        "track_ang_vel_z_exp": 0.0,
+        "ang_vel_xy_l2": -0.05,
+        "flat_orientation_l2": -1.0,
+        "dof_torques_l2": -1.5e-7,
+        "dof_acc_l2": -1.25e-7,
+        "action_rate_l2": -0.0025,
+        "dof_pos_limits": -1.0,
+        "joint_deviation_hip": -0.05,
+        "joint_deviation_arms": -0.01,
+        "joint_deviation_fingers": 0.0,
+        "joint_deviation_torso": -0.05,
+        "feet_air_time": 0.0,
+        "feet_slide": -0.1,
+        "forward_progress": 5.0,
+        "time_cost": -0.1,
+        "finish_bonus": 100.0,
+        "heading_error_l2": -0.2,
+        "lateral_velocity_l2": -0.1,
+    }
+    race_finish_time_bonus_fraction = 0.5  # adds at most 50 to the default 100 finish reward
+
     def stage1_weight(self, name: str, terrain_mode: str) -> float | None:
         """Resolve the effective weight without mutating the configured plane weights."""
         weight = self.stage1_weights.get(name)
@@ -170,7 +195,27 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         "feet_slide": feet_slide,
     }
 
-    if env.cfg.stage1:
+    if env.cfg.terrain_mode == "race":
+        position = env._race_position()
+        length = env.cfg.race_track_length
+        progress = position[:, 0].clamp(0, length) - env._race_previous_xy[:, 0].clamp(0, length)
+        elapsed = env.episode_length_buf.float() * env.step_dt
+        speed_bonus = (1.0 - elapsed / env.cfg.race_episode_length_s).clamp(0, 1)
+        unpaid = ~env._race_terminal_paid
+        heading_error = torch.remainder(env._target_heading - data.heading_w.torch + torch.pi, 2 * torch.pi) - torch.pi
+        rewards.update(
+            {
+                "termination": (env._race_fell & unpaid).float() / env.step_dt,
+                "forward_progress": progress / env.step_dt,
+                "time_cost": torch.ones_like(progress),
+                "finish_bonus": (env._race_finished & ~env._race_fell & unpaid).float()
+                * (1.0 + cfg.race_finish_time_bonus_fraction * speed_bonus)
+                / env.step_dt,
+                "heading_error_l2": heading_error.square(),
+                "lateral_velocity_l2": data.root_lin_vel_w.torch[:, 1].square(),
+            }
+        )
+    elif env.cfg.stage1:
         # The direction and origin are captured at reset; turning does not rotate this line.
         heading = env._target_heading
         offset = data.root_pos_w.torch[:, :2] - env._stage1_start_pos[:, :2]
