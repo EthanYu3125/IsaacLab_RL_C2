@@ -60,7 +60,7 @@ class RewardsCfg:
         "termination": -400.0,
         "track_lin_vel_xy_exp": 0.0,
         "track_ang_vel_z_exp": 0.0,
-        "ang_vel_xy_l2": -0.2,
+        "ang_vel_xy_l2": -0.3,
         "flat_orientation_l2": -4.0,
         "dof_torques_l2": -1.5e-7,
         "dof_acc_l2": -1.25e-7,
@@ -73,10 +73,10 @@ class RewardsCfg:
         "feet_air_time": 0.0,
         "feet_slide": -0.5,
         "forward_progress": 5.0,
-        "lateral_drift_l2": -2.4,  # modestly tighten the path for continuation training
-        "heading_error_l2": -2.2,
-        "lateral_velocity_l2": -2.2,
-        "yaw_rate_error_l2": -0.2,
+        "lateral_drift_l2": -2.8,  # modestly tighten the path for continuation training
+        "heading_error_l2": -2.5,
+        "lateral_velocity_l2": -2.5,
+        "yaw_rate_error_l2": -0.5,
         "lin_vel_z_l2": -0.5,
     }
     # Retained only for the environment's landing statistics; they do not affect rewards.

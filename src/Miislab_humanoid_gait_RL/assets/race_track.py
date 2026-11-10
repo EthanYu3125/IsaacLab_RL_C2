@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-RACE_TRACK_LENGTH = 50.0
+RACE_TRACK_LENGTH = 25.0
 RACE_TRACK_WIDTH = 2.5
 BUFFER_LENGTH = 2.0
 FENCE_THICKNESS = 0.12
