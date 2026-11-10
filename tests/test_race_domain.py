@@ -84,7 +84,8 @@ def test_random_resets_keep_centerline_domains_and_other_worlds_unchanged(module
         assert (env._commands[:, 2] * env._race_initial_yaw < 0).all()
         terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
         assert (terms["forward_progress"] == 0).all()
-        torch.testing.assert_close(terms["lateral_drift_l2"], env._race_initial_y.square())
+        # Reward follows the actual reset line; evaluation metrics still use the lane centerline.
+        torch.testing.assert_close(terms["lateral_drift_l2"], torch.zeros(env.num_envs))
         torch.testing.assert_close(terms["heading_error_l2"], env._race_initial_yaw.square())
     torch.testing.assert_close(a._race_previous_xy, b._race_previous_xy)
     params = [v.clone() for v in (a._race_lengths, a._race_widths, a._race_frictions)]

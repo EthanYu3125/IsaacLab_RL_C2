@@ -284,8 +284,6 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
                 raise ValueError(f"{name} must satisfy 0 <= value < {upper}")
         if not math.isfinite(self.race_spawn_yaw_deg) or not 0 <= self.race_spawn_yaw_deg <= 180:
             raise ValueError("race_spawn_yaw_deg must be between 0 and 180")
-        if not 0 <= self.rewards.race_finish_time_discount <= 1:
-            raise ValueError("race_finish_time_discount must be between 0 and 1")
         enabled = self.race_randomization_enabled
         friction = self.scene.terrain.physics_material.dynamic_friction
         if not math.isfinite(friction) or friction <= 0:

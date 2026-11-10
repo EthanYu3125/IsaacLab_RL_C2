@@ -138,11 +138,8 @@ def test_finish_fall_timeout_precedence_and_event_rewards(env):
     assert env._race_finished.tolist() == [True, False, False, False]
     assert env.reset_terminated.tolist() == [True, True, False, True]
     assert env.reset_time_outs.tolist() == [False, False, True, False]
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([100, 0, 0, 0.0]))
-    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([0, -0.5, 0, -0.5]))
-    env._get_rewards()  # repeated accounting cannot pay a terminal event again
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([100, 0, 0, 0.0]))
-    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([0, -1.0, 0, -1.0]))
+    assert "finish_bonus" not in env._episode_sums
+    torch.testing.assert_close(env._episode_sums["termination"], torch.tensor([0, -8.0, 0, -8.0]))
     env._reset_idx(None)
     logs = env.extras["log"]
     assert logs["Episode_Race/success_rate"] == 0.25
@@ -175,28 +172,27 @@ def test_missing_ground_filter_fails_loudly(env, bad):
 
 
 @pytest.mark.parametrize("dt", [0.01, 0.02, 0.04])
-def test_distance_rewards_net_progress_and_event_scale(modules, dt):
+def test_forward_reward_uses_signed_uncapped_velocity_and_stage1_time_scale(modules, dt):
     env = make_env(modules, num_envs=1, terrain_mode="race")
     env.step_dt = dt
     env.max_episode_length = round(30 / dt)
-    total = 0
-    for x in [1, 1, 0, -2, 0, 10]:
-        total += advance(env, [x, 0]).item()
-    assert total == pytest.approx(50 - 0.1 * dt * 6)
-    # Full overshoot earns exactly the remaining 40 m, and the bonus is independent of dt.
+    for x, speed in [(1, 1.0), (1, 0.0), (0, -1.0), (-2, -2.0), (0, 2.0), (10, 3.0)]:
+        env._robot.data.root_lin_vel_w.torch[:, 0] = speed
+        assert advance(env, [x, 0]).item() == pytest.approx(5 * speed * dt)
+    # Crossing the line gets only normal motion reward, without a special event bonus.
     env.episode_length_buf[:] = round(30 / dt) - 1
     reward = advance(env, [55, 0]).item()
-    assert reward == pytest.approx(200 + 100 - 0.1 * dt, abs=3e-5)
+    assert reward == pytest.approx(15 * dt)
 
 
-def test_faster_finish_beats_slow_and_falling(modules):
+def test_finish_time_does_not_change_stage1_reward_and_failure_is_penalized(modules):
     env = make_env(modules, terrain_mode="race")
     env.episode_length_buf[:] = torch.tensor([499, 999, 1499, 1])
     env._robot.data.projected_gravity_b.torch[3, 2] = 0
     reward = advance(env, [50, 0])
-    assert reward[0] > reward[1] > reward[2] > reward[3]
-    # Waiting at the starting line until timeout costs less than intentionally falling at once.
-    assert -0.1 * env.cfg.race_episode_length_s > env.cfg.rewards.race_weights["unsafe_state"]
+    torch.testing.assert_close(reward[:3], torch.full((3,), 5 * 0.5 * env.step_dt))
+    assert reward[3] < reward[0]
+    torch.testing.assert_close(env._episode_sums["termination"], torch.tensor([0, 0, 0, -8.0]))
 
 
 @pytest.mark.parametrize("stage1", [False, True])
@@ -212,7 +208,7 @@ def test_observations_commands_and_reward_immutability(modules, stage1):
     torch.testing.assert_close(obs[:, 86:123], env._actions)
     before = tensors_in(env)
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    assert len(terms) == 24 and terms.keys() == env.cfg.rewards.race_weights.keys()
+    assert len(terms) == 21 and terms.keys() == env.cfg.rewards.race_weights.keys()
     for value in terms.values():
         assert value.shape == (4,) and torch.isfinite(value).all()
     after = tensors_in(env)
@@ -223,7 +219,7 @@ def test_observations_commands_and_reward_immutability(modules, stage1):
 
 
 def test_missing_race_weight_is_rejected(env):
-    del env.cfg.rewards.race_weights["time_cost"]
+    del env.cfg.rewards.race_weights["forward_progress"]
     with pytest.raises(KeyError, match="race_weights"):
         env._get_rewards()
 
@@ -235,7 +231,7 @@ def test_fence_contact_threshold_and_per_environment_isolation(env, modules, for
     before = matrix.clone()
     env._get_dones()
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    torch.testing.assert_close(terms["unsafe_state"], torch.tensor([0.0, expected, 0.0, 0.0]))
+    torch.testing.assert_close(terms["termination"], torch.tensor([0.0, expected, 0.0, 0.0]))
     torch.testing.assert_close(matrix, before)
 
 
@@ -245,21 +241,21 @@ def test_fence_penalty_is_time_scaled_and_not_multiplied_by_contacts(env, module
     matrix[0, 0, 0, 0, 1] = 10
     matrix[1, :, :, :, 1] = -10
     env._get_dones()
-    torch.testing.assert_close(env._get_rewards() - baseline, torch.tensor([-0.5, -0.5, 0.0, 0.0]))
+    torch.testing.assert_close(env._get_rewards() - baseline, torch.tensor([-8.0, -8.0, 0.0, 0.0]))
     assert env._get_dones()[0].tolist() == [True, True, False, False]
     env.step_dt = 0.01
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    penalty = terms["unsafe_state"] * env.cfg.rewards.race_weights["unsafe_state"] * env.step_dt
-    torch.testing.assert_close(penalty, torch.tensor([-0.25, -0.25, 0.0, 0.0]))
+    penalty = terms["termination"] * env.cfg.rewards.race_weights["termination"] * env.step_dt
+    torch.testing.assert_close(penalty, torch.tensor([-4.0, -4.0, 0.0, 0.0]))
     matrix.zero_()
     env._get_dones()
-    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["unsafe_state"].any()
+    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["termination"].any()
 
 
 def test_ground_contacts_do_not_create_fence_penalty(env, modules):
     env._contact_sensor.data.net_normal_forces_w_history.torch[:] = 100
     env._get_dones()
-    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["unsafe_state"].any()
+    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["termination"].any()
 
 
 def test_missing_fence_matrix_is_not_silently_ignored(env, modules):
@@ -276,7 +272,7 @@ def test_unsafe_crossing_terminates_and_reset_starts_new_episode(env):
     advance(env, [51, 0])
     assert env._race_finished.tolist() == [False, False, False, True]
     assert env.reset_terminated.all() and not env.reset_time_outs.any()
-    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-0.5, -0.5, -0.5, 0.0]))
+    torch.testing.assert_close(env._episode_sums["termination"], torch.tensor([-8.0, -8.0, -8.0, 0.0]))
     env._reset_idx(None)
     records = env.extras["race_episode"]
     assert records["success"].tolist() == [False, False, False, True]
@@ -287,11 +283,13 @@ def test_unsafe_crossing_terminates_and_reset_starts_new_episode(env):
     env._torso_ground_sensor.data.normal_force_matrix_w_history.torch.zero_()
     env._fence_contact_sensor.data.normal_force_matrix_w_history.torch.zero_()
     env._robot.data.projected_gravity_b.torch[:, 2] = -1
+    env._robot.data.root_lin_vel_w.torch[:, 0] = 1.0
     advance(env, [1, 0])
     assert not env.reset_terminated.any() and not env.reset_time_outs.any()
     assert not env._race_ever_fell.any() and not env._race_ever_fence.any()
-    assert not env._episode_sums["finish_bonus"].any()
-    torch.testing.assert_close(env._episode_sums["forward_progress"], torch.full((4,), 5.0))
+    assert "finish_bonus" not in env._episode_sums
+    assert not env._episode_sums["termination"].any()
+    torch.testing.assert_close(env._episode_sums["forward_progress"], torch.full((4,), 5 * env.step_dt))
 
 
 @pytest.mark.parametrize("dt", [0.01, 0.02, 0.04])
@@ -304,7 +302,7 @@ def test_accidents_end_episode_with_time_scaled_penalty_and_partial_reset(dt, mo
     advance(env, [0, 0])
     assert env.reset_terminated.tolist() == [True, True, True, False]
     assert not env.reset_time_outs.any()
-    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-25, -25, -25, 0.0]) * dt)
+    torch.testing.assert_close(env._episode_sums["termination"], torch.tensor([-400, -400, -400, 0.0]) * dt)
     env._reset_idx(torch.tensor([0, 1, 2]))
     assert env.extras["race_episode"]["env_ids"].tolist() == [0, 1, 2]
     torch.testing.assert_close(env.extras["race_episode"]["unsafe_seconds"], torch.full((3,), dt))
@@ -320,7 +318,8 @@ def test_fence_collision_beats_finish_and_timeout_and_logs_collision(env):
     assert env.reset_terminated.tolist() == [True, True, False, False]
     assert env.reset_time_outs.tolist() == [False, False, True, True]
     assert env._race_finished.tolist() == [True, False, False, False]
-    assert env._episode_sums["finish_bonus"][1] == 0
+    assert "finish_bonus" not in env._episode_sums
+    assert env._episode_sums["termination"][1] == -8
     env._reset_idx(torch.tensor([1]))
     record = env.extras["race_episode"]
     assert record["env_ids"].tolist() == [1] and record["fence_contact"].item()
@@ -331,6 +330,7 @@ def test_fence_collision_beats_finish_and_timeout_and_logs_collision(env):
 def test_complete_trajectories_favor_straight_and_corrective_yaw(modules):
     env = make_env(modules, terrain_mode="race")
     total = torch.zeros(4)
+    env._robot.data.root_lin_vel_w.torch[:, 0] = torch.tensor([1.0, 1.0, 1.0, 0.0])
     for step in range(1, 101):
         t = step * env.step_dt
         xy = torch.tensor([[t, 0], [t, 0.2 * t], [t, 0], [0, 0]])
@@ -349,25 +349,17 @@ def test_late_crossing_after_deadline_is_timeout(env):
     env.episode_length_buf[:] = env.max_episode_length
     advance(env, [50, 0])
     assert not env.reset_terminated.any() and env.reset_time_outs.all()
-    assert not env._episode_sums["finish_bonus"].any()
+    assert "finish_bonus" not in env._episode_sums
+    assert not env._episode_sums["termination"].any()
 
 
-def test_light_oscillations_cost_more_without_removing_forward_incentive(modules):
+def test_stage1_profile_penalizes_light_oscillations_without_removing_forward_incentive(modules):
     # Equal prescribed forward motion: straight, lateral sway, yaw sway, roll sway, action chatter, idle.
     # Synthetic kinematics verify reward preferences, not whether a policy can realize these trajectories.
     env = make_env(modules, num_envs=6, terrain_mode="race")
     total = torch.zeros(6)
-    previous_weights = {
-        **env.cfg.rewards.race_weights,
-        "lateral_drift_l2": -3.0,
-        "heading_error_l2": -3.0,
-        "lateral_velocity_l2": -2.2,
-        "yaw_rate_error_l2": -0.2,
-        "ang_vel_xy_l2": -0.2,
-        "flat_orientation_l2": -4.0,
-        "action_rate_l2": -0.005,
-    }
     data = env._robot.data
+    data.root_lin_vel_w.torch[:, 0] = torch.tensor([1, 1, 1, 1, 1, 0.0])
     omega = 2 * math.pi
     for step in range(1, 201):
         t = step * env.step_dt
@@ -385,13 +377,6 @@ def test_light_oscillations_cost_more_without_removing_forward_incentive(modules
         env._actions[4] = 0.1 * (-1) ** step
         env._update_yaw_rate_command()
         total += advance(env, xy)
-    previous_total = sum(
-        value * previous_weights[name] / env.cfg.rewards.race_weights[name]
-        for name, value in env._episode_sums.items()
-        if env.cfg.rewards.race_weights[name] != 0
-    )
-    torch.testing.assert_close(total[0], previous_total[0], atol=1e-4, rtol=1e-5)
-    assert (total[1:5] < previous_total[1:5]).all()  # more damping for each symptom
     assert (total[0] > total[1:5]).all()
     assert (total[1:5] > 0.9 * total[0]).all()  # mild sway still favors moving over stopping
     assert (total[1:5] > total[5]).all()
@@ -402,12 +387,13 @@ def test_light_oscillations_cost_more_without_removing_forward_incentive(modules
 
 @pytest.mark.parametrize("side", [-1, 1])
 @pytest.mark.parametrize("dt", [0.01, 0.02, 0.04])
-def test_damping_preserves_incentive_to_recover_toward_centerline(modules, side, dt):
+def test_stage1_profile_preserves_incentive_to_recover_toward_reset_line(modules, side, dt):
     # Same initial lateral/heading errors: recover, hold the offset, or continue drifting away.
     env = make_env(modules, num_envs=3, terrain_mode="race")
     env.step_dt = dt
     total = torch.zeros(3)
     data = env._robot.data
+    data.root_lin_vel_w.torch[:, 0] = 1.0
     for step in range(1, round(4 / dt) + 1):
         t = step * dt
         decay = math.exp(-t)
