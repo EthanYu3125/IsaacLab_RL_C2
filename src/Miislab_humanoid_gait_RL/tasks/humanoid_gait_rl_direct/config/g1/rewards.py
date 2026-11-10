@@ -86,12 +86,18 @@ class RewardsCfg:
     # Uphill/downhill motion is necessary on rough terrain. Raw terms remain unchanged.
     stage1_rough_weight_overrides: dict[str, float] = {"lin_vel_z_l2": 0.0}
 
-    # Race keeps the stable straight-walking costs, with recoverable accidents and a timed finish.
+    # Race adds damping for small lateral/yaw oscillations while retaining corrective turns.
+    # Position/heading costs grow modestly; velocity costs act before deviations accumulate.
     race_weights: dict[str, float] = {
         **stage1_weights,
         "termination": 0.0,
-        "lateral_drift_l2": -3.0,
-        "heading_error_l2": -3.0,
+        "lateral_drift_l2": -3.5,
+        "heading_error_l2": -4.0,
+        "lateral_velocity_l2": -4.0,
+        "yaw_rate_error_l2": -0.6,  # penalizes deviation from the corrective yaw command, not turning itself
+        "ang_vel_xy_l2": -0.35,
+        "flat_orientation_l2": -5.0,
+        "action_rate_l2": -0.0075,
         "unsafe_state": -25.0,
         "time_cost": -0.1,
         "finish_bonus": 500.0,

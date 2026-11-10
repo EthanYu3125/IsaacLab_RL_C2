@@ -350,3 +350,74 @@ def test_late_crossing_after_deadline_is_timeout(env):
     advance(env, [50, 0])
     assert not env.reset_terminated.any() and env.reset_time_outs.all()
     assert not env._episode_sums["finish_bonus"].any()
+
+
+def test_light_oscillations_cost_more_without_removing_forward_incentive(modules):
+    # Equal prescribed forward motion: straight, lateral sway, yaw sway, roll sway, action chatter, idle.
+    # Synthetic kinematics verify reward preferences, not whether a policy can realize these trajectories.
+    env = make_env(modules, num_envs=6, terrain_mode="race")
+    total = torch.zeros(6)
+    previous_weights = {
+        **env.cfg.rewards.race_weights,
+        "lateral_drift_l2": -3.0,
+        "heading_error_l2": -3.0,
+        "lateral_velocity_l2": -2.2,
+        "yaw_rate_error_l2": -0.2,
+        "ang_vel_xy_l2": -0.2,
+        "flat_orientation_l2": -4.0,
+        "action_rate_l2": -0.005,
+    }
+    data = env._robot.data
+    omega = 2 * math.pi
+    for step in range(1, 201):
+        t = step * env.step_dt
+        sine, cosine = math.sin(omega * t), math.cos(omega * t)
+        xy = torch.zeros(6, 2)
+        xy[:5, 0] = t
+        xy[1, 1] = 0.05 * sine
+        data.root_lin_vel_w.torch[1, 1] = 0.05 * omega * cosine
+        data.heading_w.torch[2] = 0.06 * sine
+        data.root_ang_vel_w.torch[2, 2] = 0.06 * omega * cosine
+        roll = 0.04 * sine
+        data.projected_gravity_b.torch[3] = torch.tensor([0, math.sin(roll), -math.cos(roll)])
+        data.root_ang_vel_b.torch[3, 0] = 0.04 * omega * cosine
+        env._previous_actions = env._actions.clone()
+        env._actions[4] = 0.1 * (-1) ** step
+        env._update_yaw_rate_command()
+        total += advance(env, xy)
+    previous_total = sum(
+        value * previous_weights[name] / env.cfg.rewards.race_weights[name]
+        for name, value in env._episode_sums.items()
+        if env.cfg.rewards.race_weights[name] != 0
+    )
+    torch.testing.assert_close(total[0], previous_total[0], atol=1e-4, rtol=1e-5)
+    assert (total[1:5] < previous_total[1:5]).all()  # more damping for each symptom
+    assert (total[0] > total[1:5]).all()
+    assert (total[1:5] > 0.9 * total[0]).all()  # mild sway still favors moving over stopping
+    assert (total[1:5] > total[5]).all()
+    torch.testing.assert_close(
+        env._episode_sums["forward_progress"], torch.tensor([20, 20, 20, 20, 20, 0.0]), atol=1e-4, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("side", [-1, 1])
+@pytest.mark.parametrize("dt", [0.01, 0.02, 0.04])
+def test_damping_preserves_incentive_to_recover_toward_centerline(modules, side, dt):
+    # Same initial lateral/heading errors: recover, hold the offset, or continue drifting away.
+    env = make_env(modules, num_envs=3, terrain_mode="race")
+    env.step_dt = dt
+    total = torch.zeros(3)
+    data = env._robot.data
+    for step in range(1, round(4 / dt) + 1):
+        t = step * dt
+        decay = math.exp(-t)
+        y = side * torch.tensor([0.3 * decay, 0.3, 0.3 + 0.05 * t])
+        data.root_lin_vel_w.torch[:, 1] = side * torch.tensor([-0.3 * decay, 0, 0.05])
+        data.heading_w.torch[:] = side * torch.tensor([0.1 * decay, 0.1, 0.1 + 0.02 * t])
+        data.root_ang_vel_w.torch[:, 2] = side * torch.tensor([-0.1 * decay, 0, 0.02])
+        env._update_yaw_rate_command()
+        total += advance(env, torch.stack((torch.full((3,), t), y), dim=1))
+    assert total[0] > total[1] > total[2]
+    torch.testing.assert_close(env._episode_sums["forward_progress"], torch.full((3,), 20.0), atol=1e-4, rtol=1e-5)
+    assert env._episode_sums["yaw_rate_error_l2"][0].item() == pytest.approx(0, abs=1e-12)
+    assert not env.reset_terminated.any()
