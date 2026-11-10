@@ -9,7 +9,7 @@ import torch
 
 
 class RaceLifecycleMixin:
-    """Race state, safe finish detection, and nonterminal accident accounting."""
+    """Race state, safe finish detection, and terminal accident accounting."""
 
     @property
     def _race_mode(self) -> bool:
@@ -93,7 +93,7 @@ class RaceLifecycleMixin:
         return (forces.norm(dim=-1) > threshold).flatten(1).any(dim=1)
 
     def _race_get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Terminate an episode when the agent falls; fence contact remains a penalty only."""
+        """Terminate on a fall or fence collision; either failure takes precedence over finishing."""
         torso = self._filtered_contact(self._torso_ground_sensor, self.cfg.torso_contact_threshold, "ground")
         fence = self._filtered_contact(
             self._fence_contact_sensor, self.cfg.rewards.race_fence_contact_force_threshold, "fence"
@@ -116,7 +116,7 @@ class RaceLifecycleMixin:
         crossed &= crossing_y.abs() <= self._race_widths / 2
         crossed &= ~self._race_fell & ~fence & (self.episode_length_buf <= self.max_episode_length)
         self._race_finished |= crossed
-        terminated = self._race_finished | self._race_fell
+        terminated = self._race_finished | self._race_fell | self._race_fence
         truncated = (self.episode_length_buf >= self.max_episode_length) & ~terminated
         return terminated, truncated
 
@@ -138,10 +138,12 @@ class RaceLifecycleMixin:
             self._race_sums[key] += value * active
         self._race_max_lateral[:] = torch.maximum(self._race_max_lateral, lateral * active)
         self._race_previous_xy[:] = self._race_position()
-        self._race_terminal_paid |= self._race_finished  # Falling never consumes the finish reward.
+        self._race_terminal_paid |= self._race_finished | self._race_fell | self._race_fence
 
     def _race_episode_logs(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-        completed = (self._race_finished | self._race_fell | self.reset_time_outs) & (self.episode_length_buf > 0)
+        completed = (self._race_finished | self._race_fell | self._race_fence | self.reset_time_outs) & (
+            self.episode_length_buf > 0
+        )
         ids = env_ids[completed[env_ids]]
         if len(ids) == 0:
             return {}

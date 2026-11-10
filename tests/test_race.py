@@ -151,7 +151,7 @@ def test_finish_fall_timeout_precedence_and_event_rewards(env):
     assert logs["Episode_Race/finish_time_s"] == 30
 
 
-def test_fence_contact_does_not_terminate_but_fall_does(env):
+def test_unfiltered_contact_is_ignored_and_ground_contact_or_fall_terminates(env):
     env._contact_sensor.data.net_normal_forces_w_history.torch[:, :, 2, :] = 1000
     advance(env, [10, 2.5])
     assert not env.reset_terminated.any()
@@ -246,7 +246,7 @@ def test_fence_penalty_is_time_scaled_and_not_multiplied_by_contacts(env, module
     matrix[1, :, :, :, 1] = -10
     env._get_dones()
     torch.testing.assert_close(env._get_rewards() - baseline, torch.tensor([-0.5, -0.5, 0.0, 0.0]))
-    assert not env._get_dones()[0].any()  # Fence contact alone is a penalty, not a fall.
+    assert env._get_dones()[0].tolist() == [True, True, False, False]
     env.step_dt = 0.01
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
     penalty = terms["unsafe_state"] * env.cfg.rewards.race_weights["unsafe_state"] * env.step_dt
@@ -268,47 +268,64 @@ def test_missing_fence_matrix_is_not_silently_ignored(env, modules):
         env._get_dones()
 
 
-def test_unsafe_crossing_requires_reentry_but_recovery_can_finish(env):
+def test_unsafe_crossing_terminates_and_reset_starts_new_episode(env):
     env._race_previous_xy[:, 0] = 49
     env._torso_ground_sensor.data.normal_force_matrix_w_history.torch[0, :, 0, 0, 2] = 5
     env._fence_contact_sensor.data.normal_force_matrix_w_history.torch[1:3, :, 0, 0, 1] = 5
     env._robot.data.projected_gravity_b.torch[2, 2] = 0
     advance(env, [51, 0])
     assert env._race_finished.tolist() == [False, False, False, True]
+    assert env.reset_terminated.all() and not env.reset_time_outs.any()
     torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-0.5, -0.5, -0.5, 0.0]))
+    env._reset_idx(None)
+    records = env.extras["race_episode"]
+    assert records["success"].tolist() == [False, False, False, True]
+    assert records["fell"].tolist() == [True, False, True, False]
+    assert records["fence_contact"].tolist() == [False, True, True, False]
+    assert not env._race_finished.any() and not env._race_terminal_paid.any()
+    assert not env.episode_length_buf.any()
     env._torso_ground_sensor.data.normal_force_matrix_w_history.torch.zero_()
     env._fence_contact_sensor.data.normal_force_matrix_w_history.torch.zero_()
     env._robot.data.projected_gravity_b.torch[:, 2] = -1
-    advance(env, [52, 0])  # recovery beyond the line cannot retroactively finish
-    assert env._race_finished.tolist() == [False, False, False, True]
-    advance(env, [49, 0])
-    advance(env, [50, 0])
-    assert env._race_finished.all()
-    assert env._race_ever_fell.tolist() == [True, False, True, False]
-    assert env._race_ever_fence.tolist() == [False, True, True, False]
-    torch.testing.assert_close(env._race_sums["unsafe_seconds"], torch.tensor([0.02, 0.02, 0.02, 0.0]))
-    torch.testing.assert_close(env._episode_sums["finish_bonus"][:3], torch.full((3,), 500 - 400 * 0.08 / 30))
-    env._reset_idx(None)
-    assert env.extras["race_episode"]["success"].all()
-    assert env.extras["race_episode"]["fell"].tolist() == [True, False, True, False]
+    advance(env, [1, 0])
+    assert not env.reset_terminated.any() and not env.reset_time_outs.any()
+    assert not env._race_ever_fell.any() and not env._race_ever_fence.any()
+    assert not env._episode_sums["finish_bonus"].any()
+    torch.testing.assert_close(env._episode_sums["forward_progress"], torch.full((4,), 5.0))
 
 
 @pytest.mark.parametrize("dt", [0.01, 0.02, 0.04])
-def test_full_accident_duration_and_recovery(dt, modules):
+def test_accidents_end_episode_with_time_scaled_penalty_and_partial_reset(dt, modules):
     env = make_env(modules, terrain_mode="race")
     env.step_dt = dt
-    # World 0 falls, 1 hits the fence, 2 does both, 3 remains safe for one second.
+    # World 0 falls, 1 hits the fence, 2 does both, 3 remains safe.
     env._robot.data.projected_gravity_b.torch[[0, 2], 2] = 0
     env._fence_contact_sensor.data.normal_force_matrix_w_history.torch[[1, 2], :, 0, 0, 0] = 5
-    for _ in range(round(1 / dt)):
-        advance(env, [0, 0])
-    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-25, -25, -25, 0.0]))
-    env._robot.data.projected_gravity_b.torch[:, 2] = -1
-    env._fence_contact_sensor.data.normal_force_matrix_w_history.torch.zero_()
-    for _ in range(round(1 / dt)):
-        advance(env, [0, 0])
-    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-25, -25, -25, 0.0]))
-    assert not env.reset_terminated.any()
+    advance(env, [0, 0])
+    assert env.reset_terminated.tolist() == [True, True, True, False]
+    assert not env.reset_time_outs.any()
+    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-25, -25, -25, 0.0]) * dt)
+    env._reset_idx(torch.tensor([0, 1, 2]))
+    assert env.extras["race_episode"]["env_ids"].tolist() == [0, 1, 2]
+    torch.testing.assert_close(env.extras["race_episode"]["unsafe_seconds"], torch.full((3,), dt))
+    assert env.episode_length_buf.tolist() == [0, 0, 0, 1]
+    assert not env._race_sums["unsafe_seconds"].any()
+
+
+def test_fence_collision_beats_finish_and_timeout_and_logs_collision(env):
+    env.episode_length_buf[:] = env.max_episode_length - 1
+    env._race_previous_xy[:, 0] = 49
+    env._fence_contact_sensor.data.normal_force_matrix_w_history.torch[1, 0, 2, 1, 1] = 5
+    advance(env, [[50, 0], [50, 0], [49, 0], [49, 0]])
+    assert env.reset_terminated.tolist() == [True, True, False, False]
+    assert env.reset_time_outs.tolist() == [False, False, True, True]
+    assert env._race_finished.tolist() == [True, False, False, False]
+    assert env._episode_sums["finish_bonus"][1] == 0
+    env._reset_idx(torch.tensor([1]))
+    record = env.extras["race_episode"]
+    assert record["env_ids"].tolist() == [1] and record["fence_contact"].item()
+    assert not record["success"].item() and not record["fell"].item() and not record["timeout"].item()
+    assert env.extras["log"]["Episode_Race/fence_contact_rate"] == 1
 
 
 def test_complete_trajectories_favor_straight_and_corrective_yaw(modules):

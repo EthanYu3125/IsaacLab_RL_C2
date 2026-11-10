@@ -73,6 +73,7 @@ def test_random_resets_keep_centerline_domains_and_other_worlds_unchanged(module
     a, b = [make_env(modules, terrain_mode="race", randomize=True) for _ in range(2)]
     origins = torch.tensor([[200.0, -100, 0], [0, 100, 0], [-100, 0, 0], [500, 500, 0]])
     for env in (a, b):
+        env.cfg.race_spawn_yaw_deg = 5.0  # explicitly opt in when testing the optional yaw sampling stream
         env._terrain.env_origins[:] = origins
         env._reset_idx(None)
         torch.testing.assert_close(env._race_track_origins, origins[:, :2])
@@ -96,6 +97,22 @@ def test_random_resets_keep_centerline_domains_and_other_worlds_unchanged(module
     torch.testing.assert_close(a._race_initial_y[0], b._race_initial_y[0])
     for actual, before in zip((a._race_lengths, a._race_widths, a._race_frictions), params, strict=True):
         torch.testing.assert_close(actual, before)
+
+
+@pytest.mark.parametrize("play", [False, True])
+def test_default_spawn_facing_is_fixed_while_other_randomization_remains_available(modules, play):
+    env = make_env(modules, terrain_mode="race", randomize=True)
+    env.cfg.is_play = play
+    assert env.cfg.race_spawn_yaw_deg == 0.0
+    initial_y = []
+    for ids in (None, torch.tensor([0, 2]), torch.tensor([1, 3]), None):
+        env._reset_idx(ids)
+        assert (env._race_initial_yaw == 0).all()
+        assert (env._robot.data.heading_w.torch == 0).all()
+        assert (env._target_heading == 0).all() and (env._commands[:, 2] == 0).all()
+        initial_y.append(env._race_initial_y.clone())
+    if not play:
+        assert torch.stack(initial_y).abs().max() > 0  # lateral spawn randomization was not disabled
 
 
 def test_random_lane_finish_uses_each_actual_length_width(modules):

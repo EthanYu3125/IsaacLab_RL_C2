@@ -110,7 +110,9 @@ def main():
             runner.agent.enable_training_mode(False, apply_to_models=True)
             obs, _ = env.reset()
             states = env.state()
-            quotas = [options.episodes // task.num_envs + (i < options.episodes % task.num_envs) for i in range(task.num_envs)]
+            quotas = [
+                options.episodes // task.num_envs + (i < options.episodes % task.num_envs) for i in range(task.num_envs)
+            ]
             counts = [0] * task.num_envs
             max_steps = (max(quotas) + 1) * math.ceil(cfg.race_episode_length_s / task.step_dt)
             with torch.inference_mode():
@@ -124,7 +126,9 @@ def main():
                     if len(records) == options.episodes:
                         break
             if len(records) != options.episodes:
-                raise RuntimeError(f"Expected {options.episodes} episodes, received {len(records)}; inspect race resets")
+                raise RuntimeError(
+                    f"Expected {options.episodes} episodes, received {len(records)}; inspect race resets"
+                )
             report = {
                 "checkpoint": str(Path(args.checkpoint).resolve()),
                 "seed": cfg.seed,

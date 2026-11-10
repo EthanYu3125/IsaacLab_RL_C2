@@ -165,7 +165,7 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     race_domain_randomization = True
     race_randomize_in_play = False
     race_spawn_y_fraction = 0.1  # fraction of the actual full lane width
-    race_spawn_yaw_deg = 5.0
+    race_spawn_yaw_deg = 0.0  # fine-tuning starts facing +X; yaw randomization can be enabled explicitly
     race_track_size_ratio = 0.2
     race_friction_ratio = 0.1
     race_domains: list[dict[str, float]] = []  # effective values in environment order, fixed after scene construction
