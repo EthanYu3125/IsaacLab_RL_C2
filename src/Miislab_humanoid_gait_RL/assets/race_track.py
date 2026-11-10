@@ -9,8 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-RACE_TRACK_LENGTH = 30.0
-RACE_TRACK_WIDTH = 3.0
+RACE_TRACK_LENGTH = 50.0
+RACE_TRACK_WIDTH = 2.5
 BUFFER_LENGTH = 2.0
 FENCE_THICKNESS = 0.12
 COLORS = {"floor": "DCAAA0", "fence": "E9B51D", "white": "FFFFFF", "black": "151515"}
@@ -33,11 +33,16 @@ class TrackSpec:
 
     length: float = RACE_TRACK_LENGTH
     width: float = RACE_TRACK_WIDTH
+    post_intervals: int | None = None
+    finish_columns: int | None = None
 
     def __post_init__(self):
         for name, value in (("length", self.length), ("width", self.width)):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"Race track {name} must be finite and positive")
+        for name, value in (("post_intervals", self.post_intervals), ("finish_columns", self.finish_columns)):
+            if value is not None and (not isinstance(value, int) or value <= 0):
+                raise ValueError(f"{name} must be a positive integer")
 
     @property
     def env_spacing(self) -> float:
@@ -52,18 +57,20 @@ class TrackSpec:
             Part("Start", (0, 0, 0.002), (0.2, self.width, 0), "white"),
         ]
         # Two rows of 25 cm squares; trim the last column for non-multiple widths.
+        columns = self.finish_columns or math.ceil(self.width / 0.25)
+        cell_width = self.width / columns if self.finish_columns else 0.25
         for row in range(2):
-            for col in range(math.ceil(self.width / 0.25)):
-                size_y = min(0.25, self.width - col * 0.25)
+            for col in range(columns):
+                size_y = min(cell_width, self.width - col * cell_width)
                 result.append(
                     Part(
                         f"Finish_{row}_{col}",
-                        (self.length + row * 0.25 + 0.125, -self.width / 2 + col * 0.25 + size_y / 2, 0.002),
+                        (self.length + row * 0.25 + 0.125, -self.width / 2 + col * cell_width + size_y / 2, 0.002),
                         (0.25, size_y, 0),
                         "white" if (row + col) % 2 else "black",
                     )
                 )
-        intervals = math.ceil(extent / 2)
+        intervals = self.post_intervals or math.ceil(extent / 2)
         for side, sign in (("Left", 1), ("Right", -1)):
             y = sign * (self.width / 2 + FENCE_THICKNESS / 2)
             for i in range(intervals + 1):

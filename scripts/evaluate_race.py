@@ -21,11 +21,24 @@ def summarize(records: list[dict]) -> dict:
         "episodes": count,
         "success_rate": sum(r["success"] for r in records) / count,
         "fall_rate": sum(r["fell"] for r in records) / count,
+        "fence_contact_rate": sum(r["fence_contact"] for r in records) / count,
         "timeout_rate": sum(r["timeout"] for r in records) / count,
         "finish_time_mean_s": statistics.mean(finish_times) if finish_times else None,
         "finish_time_median_s": statistics.median(finish_times) if finish_times else None,
         "forward_distance_mean_m": statistics.mean(r["distance"] for r in records),
         "average_speed_mean_m_s": statistics.mean(r["distance"] / r["seconds"] for r in records),
+        **{
+            key + "_mean": statistics.mean(r[key] for r in records)
+            for key in (
+                "completion_fraction",
+                "mean_lateral_deviation",
+                "max_lateral_deviation",
+                "mean_heading_error",
+                "fall_seconds",
+                "fence_seconds",
+                "unsafe_seconds",
+            )
+        },
     }
 
 
@@ -72,8 +85,6 @@ def main():
     cfg, agent_cfg = resolve_task_config(
         args.task, resolve_skrl_agent_cfg_entry_point(args.agent, args.algorithm), play_mode=True
     )
-    if cfg.terrain_mode != "race":
-        parser.error("Evaluation requires env.terrain_mode=race")
     cfg.seed = agent_cfg["seed"] = args.seed if args.seed is not None else 42
     options.output = options.output.resolve()
     options.output.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +94,8 @@ def main():
         from isaaclab_rl.skrl import SkrlVecEnvWrapper
 
         apply_env_overrides(args, cfg)
+        if cfg.terrain_mode != "race":
+            parser.error("Evaluation requires env.terrain_mode=race")
         raw_env = create_isaaclab_env(args.task, cfg, args)
         try:
             task = raw_env.unwrapped
@@ -119,6 +132,9 @@ def main():
                 "track_length_m": cfg.race_track_length,
                 "track_width_m": cfg.race_track_width,
                 "episode_limit_s": cfg.race_episode_length_s,
+                "course": "randomized" if cfg.race_randomization_enabled else "fixed_nominal",
+                "domains": cfg.race_domains,
+                "floor_readback": task._race_floor_readback,
                 "policy": "mean_actions",
                 "use_mujoco_contacts": cfg.sim.physics.solver_cfg.use_mujoco_contacts,
                 **summarize(records),

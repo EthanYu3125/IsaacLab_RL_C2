@@ -40,6 +40,7 @@ from Miislab_humanoid_gait_RL.assets.race_track import (
     ensure_track_asset,
 )
 
+from .race_domain import race_clone_assignment, sample_race_domains
 from .rewards import RewardsCfg
 
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
@@ -160,7 +161,14 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
     terrain_mode = "race"  # "race", "rough" or "plane"; stage1 only selects the objective in legacy modes
     race_track_length = RACE_TRACK_LENGTH
     race_track_width = RACE_TRACK_WIDTH
-    race_episode_length_s = 90.0
+    race_episode_length_s = 30.0
+    race_domain_randomization = True
+    race_randomize_in_play = False
+    race_spawn_y_fraction = 0.1  # fraction of the actual full lane width
+    race_spawn_yaw_deg = 5.0
+    race_track_size_ratio = 0.2
+    race_friction_ratio = 0.1
+    race_domains: list[dict[str, float]] = []  # effective values in environment order, fixed after scene construction
     # Stage 1 commands are identical during training and play.
     stage1 = True
     stage1_lin_vel_x = 0.5  # [m/s]
@@ -266,6 +274,42 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
                 raise ValueError(f"{name} must be finite and positive")
         if not 0 < self.stage1_min_height_ratio < 1 or not 0 < self.stage1_max_tilt_deg < 180:
             raise ValueError("Race fall limits require 0 < height ratio < 1 and 0 < tilt < 180")
+        for name, upper in (
+            ("race_track_size_ratio", 1.0),
+            ("race_friction_ratio", 1.0),
+            ("race_spawn_y_fraction", 0.5),
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0 <= value < upper:
+                raise ValueError(f"{name} must satisfy 0 <= value < {upper}")
+        if not math.isfinite(self.race_spawn_yaw_deg) or not 0 <= self.race_spawn_yaw_deg <= 180:
+            raise ValueError("race_spawn_yaw_deg must be between 0 and 180")
+        if not 0 <= self.rewards.race_finish_time_discount <= 1:
+            raise ValueError("race_finish_time_discount must be between 0 and 1")
+        enabled = self.race_randomization_enabled
+        friction = self.scene.terrain.physics_material.dynamic_friction
+        if not math.isfinite(friction) or friction <= 0:
+            raise ValueError("Race ground friction must be finite and positive")
+        signature = (
+            self.race_seed,
+            self.scene.num_envs,
+            spec.length,
+            spec.width,
+            friction,
+            self.race_track_size_ratio,
+            self.race_friction_ratio,
+            enabled,
+        )
+        if getattr(self, "_race_domain_signature", None) != signature:
+            self.race_domains = sample_race_domains(*signature)
+            self._race_domain_signature = signature
+        max_scale = 1 + self.race_track_size_ratio if enabled else 1
+        max_spec = TrackSpec(spec.length * max_scale, spec.width * max_scale)
+        intervals = math.ceil((max_spec.length + 4.0) / 2.0)
+        columns = math.ceil(max_spec.width / 0.25)
+        specs = [TrackSpec(d["length"], d["width"], intervals, columns) for d in self.race_domains]
+        # Fixed topology, including visual markings, is required by homogeneous MuJoCo worlds.
+        paths = [str(ensure_track_asset(s)) for s in specs] if enabled else [str(ensure_track_asset(specs[0]))]
 
         # The CLI normally resolves presets first. Also support direct gym.make(cfg=...) callers.
         physics = self.sim.physics
@@ -284,18 +328,25 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
 
         self.episode_length_s = self.race_episode_length_s
         self.terrain_curriculum = False
-        self.scene.env_spacing = spec.env_spacing
+        self.scene.env_spacing = max_spec.env_spacing
+        self.scene.replicate_physics = True
+        self.scene.clone_cfg.clone_strategy = race_clone_assignment
+        self.scene.clone_cfg.clone_combinations = []
         self.scene.terrain = replace(
             self.scene.terrain,
             terrain_type="plane",
             terrain_generator=None,
             max_init_terrain_level=None,
-            env_spacing=spec.env_spacing,
+            env_spacing=max_spec.env_spacing,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.32, 0.52, 0.30)),
         )
         self.scene.race_track = AssetBaseCfg(
             prim_path="{ENV_REGEX_NS}/RaceTrack",
-            spawn=sim_utils.UsdFileCfg(usd_path=str(ensure_track_asset(spec))),
+            spawn=(
+                sim_utils.MultiUsdFileCfg(usd_path=paths, random_choice=False)
+                if enabled
+                else sim_utils.UsdFileCfg(usd_path=paths[0])
+            ),
         )
         # Shape filtering includes only the global ground, never the per-environment fences.
         self.scene.torso_ground_contact = ContactSensorCfg(
@@ -310,3 +361,12 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         )
         self.scene.contact_forces.force_threshold = self.rewards.feet_contact_force_threshold
         self.scene.sky_light = replace(self.scene.sky_light, spawn=sim_utils.DomeLightCfg(intensity=1000.0))
+
+    @property
+    def race_randomization_enabled(self) -> bool:
+        return self.race_domain_randomization and (not self.is_play or self.race_randomize_in_play)
+
+    @property
+    def race_seed(self) -> int:
+        seed = getattr(self, "seed", None)
+        return int(seed) if seed is not None and seed >= 0 else 42

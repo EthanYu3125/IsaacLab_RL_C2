@@ -86,32 +86,18 @@ class RewardsCfg:
     # Uphill/downhill motion is necessary on rough terrain. Raw terms remain unchanged.
     stage1_rough_weight_overrides: dict[str, float] = {"lin_vel_z_l2": 0.0}
 
-    # Race event weights are per-event; their raw terms divide by step_dt below.
+    # Race keeps the stable straight-walking costs, with recoverable accidents and a timed finish.
     race_weights: dict[str, float] = {
-        "termination": -25.0,
-        "track_lin_vel_xy_exp": 0.0,
-        "track_ang_vel_z_exp": 0.0,
-        "ang_vel_xy_l2": -0.05,
-        "flat_orientation_l2": -1.0,
-        "dof_torques_l2": -1.5e-7,
-        "dof_acc_l2": -1.25e-7,
-        "action_rate_l2": -0.0025,
-        "dof_pos_limits": -1.0,
-        "joint_deviation_hip": -0.05,
-        "joint_deviation_arms": -0.01,
-        "joint_deviation_fingers": 0.0,
-        "joint_deviation_torso": -0.05,
-        "feet_air_time": 0.0,
-        "feet_slide": -0.1,
-        "forward_progress": 5.0,
+        **stage1_weights,
+        "termination": 0.0,
+        "lateral_drift_l2": -3.0,
+        "heading_error_l2": -3.0,
+        "unsafe_state": -25.0,
         "time_cost": -0.1,
-        "fence_contact": -2.0,  # per second of detected fence contact, independent of body/contact count
-        "finish_bonus": 100.0,
-        "heading_error_l2": -0.2,
-        "lateral_velocity_l2": -0.1,
+        "finish_bonus": 500.0,
     }
-    race_finish_time_bonus_fraction = 0.5  # adds at most 50 to the default 100 finish reward
-    race_fence_contact_force_threshold = 1.0  # [N], ignore tiny contact-force noise
+    race_fence_contact_force_threshold = 1.0  # [N]
+    race_finish_time_discount = 0.8  # 500 * (1 - 0.8*t/T): 500 at t=0, 100 at the deadline
 
     def stage1_weight(self, name: str, terrain_mode: str) -> float | None:
         """Resolve the effective weight without mutating the configured plane weights."""
@@ -198,36 +184,29 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     }
 
     if env.cfg.terrain_mode == "race":
-        matrix = env._fence_contact_sensor.data.normal_force_matrix_w_history
-        if matrix is None:
-            raise RuntimeError("Race fence contact filter returned no force matrix; refusing unfiltered fallback")
-        fence_forces = matrix.torch
-        if (
-            fence_forces.ndim != 5
-            or fence_forces.shape[0] != env.num_envs
-            or min(fence_forces.shape[1:4]) == 0
-            or fence_forces.shape[-1] != 3
-        ):
-            raise RuntimeError(f"Unexpected fence-filtered contact shape: {tuple(fence_forces.shape)}")
-        fence_contact = (fence_forces.norm(dim=-1) > cfg.race_fence_contact_force_threshold).flatten(1).any(dim=1)
         position = env._race_position()
-        length = env.cfg.race_track_length
-        progress = position[:, 0].clamp(0, length) - env._race_previous_xy[:, 0].clamp(0, length)
-        elapsed = env.episode_length_buf.float() * env.step_dt
-        speed_bonus = (1.0 - elapsed / env.cfg.race_episode_length_s).clamp(0, 1)
-        unpaid = ~env._race_terminal_paid
-        heading_error = torch.remainder(env._target_heading - data.heading_w.torch + torch.pi, 2 * torch.pi) - torch.pi
+        progress = torch.minimum(position[:, 0].clamp_min(0), env._race_lengths) - torch.minimum(
+            env._race_previous_xy[:, 0].clamp_min(0), env._race_lengths
+        )
+        elapsed_fraction = (env.episode_length_buf.float() * env.step_dt / env.cfg.race_episode_length_s).clamp(0, 1)
+        heading = data.heading_w.torch
+        heading_error = torch.atan2(heading.sin(), heading.cos())
         rewards.update(
             {
-                "termination": (env._race_fell & unpaid).float() / env.step_dt,
+                "termination": torch.zeros_like(progress),
                 "forward_progress": progress / env.step_dt,
-                "time_cost": torch.ones_like(progress),
-                "fence_contact": fence_contact.float(),
-                "finish_bonus": (env._race_finished & ~env._race_fell & unpaid).float()
-                * (1.0 + cfg.race_finish_time_bonus_fraction * speed_bonus)
-                / env.step_dt,
+                "lateral_drift_l2": position[:, 1].square(),
                 "heading_error_l2": heading_error.square(),
                 "lateral_velocity_l2": data.root_lin_vel_w.torch[:, 1].square(),
+                "yaw_rate_error_l2": yaw_rate_error,
+                "lin_vel_z_l2": data.root_lin_vel_b.torch[:, 2].square(),
+                "unsafe_state": (env._race_fell | env._race_fence).float(),
+                "time_cost": torch.ones_like(progress),
+                "finish_bonus": (env._race_finished & ~env._race_terminal_paid).float()
+                * (1.0 - cfg.race_finish_time_discount * elapsed_fraction)
+                / env.step_dt,
+                "joint_deviation_arms": joint_deviation(env._arm_joint_ids) / max(len(env._arm_joint_ids), 1),
+                "joint_deviation_fingers": joint_deviation(env._finger_joint_ids) / max(len(env._finger_joint_ids), 1),
             }
         )
     elif env.cfg.stage1:

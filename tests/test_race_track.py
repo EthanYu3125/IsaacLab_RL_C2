@@ -87,3 +87,27 @@ def test_usd_parses_materials_colliders_and_two_lane_references(track_module, tm
     a, b = [cache.ComputeWorldBound(scene.GetPrimAtPath(f"/World/envs/env_{i}")).ComputeAlignedBox() for i in range(2)]
     assert a.GetMax()[1] < b.GetMin()[1]
     assert scene.GetPrimAtPath("/World/envs/env_1/RaceTrack/Start").IsValid()
+
+
+def test_randomized_lanes_have_identical_topology_and_actual_dimensions(track_module, tmp_path):
+    from pxr import Usd, UsdGeom
+
+    specs = [track_module.TrackSpec(length, width, 32, 12) for length, width in [(40, 2), (60, 3), (52.3, 2.27)]]
+    topology = None
+    scene = Usd.Stage.CreateInMemory()
+    for i, spec in enumerate(specs):
+        parts = spec.parts()
+        signature = [(p.name, p.collision, p.material) for p in parts]
+        if topology is None:
+            topology = signature
+        assert signature == topology  # same shapes, names and order for homogeneous Newton worlds
+        posts = [p for p in parts if p.name.startswith("Left_Post")]
+        assert len(posts) == 33
+        assert posts[0].center[0] == -2 and posts[-1].center[0] == spec.length + 2
+        assert parts[0].size[:2] == (spec.length + 4, spec.width)
+        lane = UsdGeom.Xform.Define(scene, f"/World/lane{i}")
+        lane.AddTranslateOp().Set((i * 66.12, 0, 0))
+        lane.GetPrim().GetReferences().AddReference(str(track_module.ensure_track_asset(spec, tmp_path)))
+    cache = UsdGeom.BBoxCache(0, ["default"])
+    boxes = [cache.ComputeWorldBound(scene.GetPrimAtPath(f"/World/lane{i}")).ComputeAlignedBox() for i in range(3)]
+    assert all(a.GetMax()[0] < b.GetMin()[0] for a, b in zip(boxes, boxes[1:], strict=False))

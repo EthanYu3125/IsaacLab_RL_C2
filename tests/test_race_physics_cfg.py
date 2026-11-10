@@ -16,6 +16,7 @@ def test_race_resolves_newton_class_without_mutating_source(monkeypatch, tmp_pat
     monkeypatch.setattr(env_cfg, "ensure_track_asset", lambda spec: tmp_path / "race.usda")
     cfg = env_cfg.HumanoidGaitRlEnvCfg()
     cfg.terrain_mode = "race"
+    cfg.scene.num_envs = 4
     original = cfg.sim.physics.default
     original.num_substeps = 3
     original.solver_cfg.iterations = 77
@@ -53,6 +54,7 @@ def test_race_passes_actual_solver_contact_configuration_check(monkeypatch, tmp_
     monkeypatch.setattr(env_cfg, "ensure_track_asset", lambda spec: tmp_path / "race.usda")
     cfg = env_cfg.HumanoidGaitRlEnvCfg()
     cfg.terrain_mode = "race"
+    cfg.scene.num_envs = 4
     cfg.configure_stage1()
     monkeypatch.setattr(PhysicsManager, "_cfg", cfg.sim.physics)
     # Only GPU solver allocation is replaced. Run the installed backend's cross-config validation.

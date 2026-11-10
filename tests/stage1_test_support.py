@@ -25,7 +25,7 @@ class Config:
     def __init__(self, **kwargs):
         for cls in reversed(type(self).__mro__):
             for name, value in vars(cls).items():
-                if not name.startswith("_") and not callable(value):
+                if not name.startswith("_") and not callable(value) and not isinstance(value, property):
                     setattr(self, name, copy.deepcopy(value))
         self.__dict__.update(kwargs)
         if hasattr(self, "__post_init__"):
@@ -111,11 +111,12 @@ def load_task_modules(monkeypatch):
         SimulationCfg=Config,
         PreviewSurfaceCfg=Config,
         UsdFileCfg=Config,
+        MultiUsdFileCfg=Config,
     )
     module("isaaclab.assets", ArticulationCfg=Config, AssetBaseCfg=Config)
     module("isaaclab.envs", DirectRLEnv=BaseEnv, DirectRLEnvCfg=Config)
     module("isaaclab.physics", PhysxAutoCfg=Config)
-    module("isaaclab.scene", InteractiveSceneCfg=Config)
+    module("isaaclab.scene", InteractiveSceneCfg=type("SceneCfg", (Config,), {"clone_cfg": Config()}))
     ray_cfg = type("RayCasterCfg", (Config,), {"OffsetCfg": Config})
     module("isaaclab.sensors", ContactSensorCfg=Config, RayCasterCfg=ray_cfg)
     module("isaaclab.sensors.patterns", GridPatternCfg=Config)
@@ -181,12 +182,14 @@ def load_task_modules(monkeypatch):
     module("isaaclab_assets", G1_MINIMAL_CFG=Config())
     module("_stage1_unit_task", __path__=[str(TASK_DIR)])
     loaded = {}
-    for name in ("rewards", "env_cfg", "race", "env"):
+    for name in ("race_domain", "rewards", "env_cfg", "race", "env"):
         full_name = f"_stage1_unit_task.{name}"
         # Register removal before import, so fixture teardown cannot leak fake imports to other tests.
         monkeypatch.setitem(sys.modules, full_name, None)
         del sys.modules[full_name]
         loaded[name] = importlib.import_module(full_name)
+    # Small scenes keep CPU contract tests from exporting thousands of lane variants.
+    loaded["env_cfg"].HumanoidGaitRlEnvCfg.scene.num_envs = 4
     return SimpleNamespace(**loaded)
 
 
@@ -292,10 +295,12 @@ class Terrain:
         self.env_origins[ids] = self.terrain_origins[self.terrain_levels[ids], self.terrain_types[ids]]
 
 
-def make_env(modules, num_envs=4, stage1=True, terrain_mode=None):
+def make_env(modules, num_envs=4, stage1=True, terrain_mode=None, randomize=False):
     env = object.__new__(modules.env.HumanoidGaitRlEnv)
     env.cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
     env.cfg.stage1 = stage1
+    env.cfg.scene.num_envs = num_envs
+    env.cfg.race_domain_randomization = randomize
     # Existing gait unit tests explicitly exercise plane behavior; rough tests request the new default.
     env.cfg.terrain_mode = terrain_mode or ("plane" if stage1 else "rough")
     env.cfg.configure_stage1()

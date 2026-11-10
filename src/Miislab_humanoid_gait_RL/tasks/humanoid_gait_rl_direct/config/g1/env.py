@@ -19,6 +19,7 @@ from isaaclab.utils import index_fill_
 from isaaclab.utils.math import quat_apply_inverse, quat_from_euler_xyz, quat_mul, sample_uniform, wrap_to_pi, yaw_quat
 
 from .race import RaceLifecycleMixin
+from .race_domain import apply_race_floor_friction
 from .rewards import compute_rewards
 
 if TYPE_CHECKING:
@@ -31,6 +32,9 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
     cfg: HumanoidGaitRlEnvCfg
 
     def __init__(self, cfg: HumanoidGaitRlEnvCfg, render_mode: str | None = None, **kwargs):
+        # Resolve random/unspecified seeds before drawing construction-time domains.
+        if cfg.terrain_mode == "race" and (cfg.seed is None or cfg.seed < 0):
+            cfg.seed = self.seed(42 if cfg.seed is None else cfg.seed)
         cfg.configure_stage1()
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -80,6 +84,15 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
             self._torso_ground_sensor = self.scene["torso_ground_contact"]
             self._fence_contact_sensor = self.scene["fence_contact"]
             self._init_race_buffers()
+            plan = self.sim.get_clone_plan()
+            if plan is None:
+                raise RuntimeError("Race domain allocation requires an Isaac Lab clone plan")
+            layout = plan.topology.world_prototype_layout
+            layout = layout.numpy() if hasattr(layout, "numpy") else layout
+            expected = list(range(self.num_envs)) if cfg.race_randomization_enabled else [0] * self.num_envs
+            if list(layout) != expected:
+                raise RuntimeError("Race asset clone order does not match sampled domains")
+            self._race_floor_readback = apply_race_floor_friction(self.sim.physics_manager, self._race_frictions)
             # Upstream dumps its config before gym.make; preserve the effective late-applied race settings too.
             if getattr(self.cfg, "log_dir", None):
                 log_dir = Path(self.cfg.log_dir)
@@ -93,6 +106,16 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
                     "use_mujoco_contacts": self.cfg.sim.physics.solver_cfg.use_mujoco_contacts,
                     "track_usd": self.cfg.scene.race_track.spawn.usd_path,
                     "race_weights": self.cfg.rewards.race_weights,
+                    "finish_time_discount": self.cfg.rewards.race_finish_time_discount,
+                    "seed": self.cfg.race_seed,
+                    "randomization_enabled": self.cfg.race_randomization_enabled,
+                    "spawn_y_fraction": self.cfg.race_spawn_y_fraction,
+                    "spawn_yaw_deg": self.cfg.race_spawn_yaw_deg,
+                    "size_ratio": self.cfg.race_track_size_ratio,
+                    "friction_ratio": self.cfg.race_friction_ratio,
+                    "domains": self.cfg.race_domains,
+                    "asset_assignment": expected,
+                    "floor_readback": self._race_floor_readback,
                 }
                 (log_dir / "race_config.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
         elif self.cfg.stage1:
@@ -243,8 +266,7 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
         if self.cfg.terrain_mode == "rough":
             self._missing_local_height_sum += (~local_valid).float()
         if self._race_mode:
-            self._race_previous_xy[:] = self._race_position()
-            self._race_terminal_paid |= self._race_finished | self._race_fell
+            self._race_record_step()
         elif self.cfg.stage1:
             self._accumulate_stage1_metrics()
             # Update history only after the reward has compared this event with the previous landing.
@@ -434,8 +456,10 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
         root_pose[:, 3:7] = quat_mul(root_pose[:, 3:7], quat_from_euler_xyz(zeros, zeros, yaw))
         root_vel = self._robot.data.default_root_vel.torch[env_ids].clone()
         if self._race_mode:
+            spawn_y, spawn_yaw = self._sample_race_spawn(env_ids)
             root_pose[:, :2] = self._terrain.env_origins[env_ids, :2]
-            root_pose[:, 3:7] = quat_from_euler_xyz(zeros, zeros, zeros)
+            root_pose[:, 1] += spawn_y
+            root_pose[:, 3:7] = quat_from_euler_xyz(zeros, zeros, spawn_yaw)
             root_vel.zero_()
         # joints: default pose at rest
         joint_pos = self._robot.data.default_joint_pos.torch[env_ids].clone()
@@ -448,18 +472,24 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
         # commands depend on the new heading, so sample them after the root pose is written
         self._reset_line_state(env_ids, root_pose)
         if self._race_mode:
-            self._reset_race_state(env_ids)
+            self._reset_race_state(env_ids, root_pose)
         elif self.cfg.stage1:
             self._reset_stage1_state(env_ids, root_pose)
         self._resample_commands(env_ids)
+        if self._race_mode:
+            # Use the composed reset pose, not a potentially stale cached simulator heading.
+            self._commands[env_ids, 2] = (
+                -self._race_initial_yaw[env_ids] * self.cfg.stage1_heading_control_stiffness
+            ).clamp(-self.cfg.stage1_max_yaw_rate, self.cfg.stage1_max_yaw_rate)
 
         # logging
         extras = dict()
         for key in self._episode_sums:
             extras["Episode_Reward/" + key] = torch.mean(self._episode_sums[key][env_ids]) / self.max_episode_length_s
             index_fill_(self._episode_sums[key], env_ids, 0.0)
-        extras["Episode_Termination/torso_contact"] = torso_failures
-        extras["Episode_Termination/lateral_out_of_bounds"] = lateral_failures
+        if not self._race_mode:
+            extras["Episode_Termination/torso_contact"] = torso_failures
+            extras["Episode_Termination/lateral_out_of_bounds"] = lateral_failures
         # Simultaneous failure and time limit is a failed episode, not a successful completion.
         completed = self.reset_time_outs[env_ids] & ~self.reset_terminated[env_ids]
         extras["Episode_Termination/time_out"] = torch.count_nonzero(completed)

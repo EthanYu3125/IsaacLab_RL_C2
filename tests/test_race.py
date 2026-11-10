@@ -28,7 +28,7 @@ def env(modules):
 def advance(env, xy, steps=1):
     """Run real post-physics hooks against a synthetic world position."""
     env.episode_length_buf += steps
-    env._robot.data.root_pos_w.torch[:, :2] = torch.as_tensor(xy) + env._reset_line_start_pos
+    env._robot.data.root_pos_w.torch[:, :2] = torch.as_tensor(xy) + env._race_track_origins
     env.reset_terminated[:], env.reset_time_outs[:] = env._get_dones()
     return env._get_rewards()
 
@@ -39,6 +39,7 @@ def test_configuration_and_legacy_isolation(modules, stage1, play_order):
     cfg = modules.env_cfg.HumanoidGaitRlEnvCfg()
     assert cfg.terrain_mode == "race"
     cfg.stage1 = stage1
+    cfg.race_domain_randomization = False
     cfg.race_track_length, cfg.race_track_width = 40.0, 4.0
     cfg.race_episode_length_s = 120
     if play_order == "before":
@@ -96,7 +97,7 @@ def test_spawn_at_each_start_center_and_partial_reset(modules, stage1):
     assert (env._robot.data.root_lin_vel_w.torch == 0).all()
     assert (env._commands == torch.tensor([0.5, 0, 0])).all()
     assert (env.episode_length_buf == 0).all()
-    advance(env, [[31, 0], [4, 0], [5, 0], [6, 0]])
+    advance(env, [[51, 0], [4, 0], [5, 0], [6, 0]])
     old_pos = env._robot.data.root_pos_w.torch.clone()
     old_prev = env._race_previous_xy.clone()
     env._reset_idx(torch.tensor([0]))
@@ -104,7 +105,7 @@ def test_spawn_at_each_start_center_and_partial_reset(modules, stage1):
     torch.testing.assert_close(env._race_previous_xy[1:], old_prev[1:])
     assert (env._race_previous_xy[0] == 0).all()
     assert env.extras["race_episode"]["env_ids"].tolist() == [0]
-    assert env.extras["race_episode"]["distance"].item() == 30
+    assert env.extras["race_episode"]["distance"].item() == 50
     assert not env._race_finished[0] and not env._race_terminal_paid[0]
     assert not env._terrain.updates
     env._pre_physics_step(torch.zeros_like(env._actions))
@@ -114,43 +115,43 @@ def test_spawn_at_each_start_center_and_partial_reset(modules, stage1):
 
 
 def test_crossing_interpolates_width_and_requires_forward_direction(env):
-    env._race_previous_xy[:] = torch.tensor([[29, 0], [29, 4], [30.1, 0], [29, 0]])
-    advance(env, [[31, 2], [31, 0], [29, 0], [35, 0]])
+    env._race_previous_xy[:] = torch.tensor([[49, 0], [49, 4], [50.1, 0], [49, 0]])
+    advance(env, [[51, 2], [51, 0], [49, 0], [55, 0]])
     assert env._race_finished.tolist() == [True, False, False, True]
     assert env.reset_terminated.tolist() == [True, False, False, True]
     assert not env.reset_time_outs.any()
 
 
 @pytest.mark.parametrize("side", [-1, 1])
-@pytest.mark.parametrize("y,success", [(1.5, True), (1.501, False)])
+@pytest.mark.parametrize("y,success", [(1.25, True), (1.251, False)])
 def test_finish_width_boundary(env, side, y, success):
-    advance(env, [30, side * y])
+    advance(env, [50, side * y])
     assert env._race_finished.tolist() == [success] * 4
 
 
 def test_finish_fall_timeout_precedence_and_event_rewards(env):
     env.episode_length_buf[:] = env.max_episode_length - 1
-    env._race_previous_xy[:, 0] = 29
+    env._race_previous_xy[:, 0] = 49
     env._torso_ground_sensor.data.normal_force_matrix_w_history.torch[1, :, 0, 0, 2] = 5
     env._robot.data.projected_gravity_b.torch[3, 2] = 0
-    advance(env, [[30, 0], [30, 0], [29, 0], [29, 0]])
+    advance(env, [[50, 0], [50, 0], [49, 0], [49, 0]])
     assert env._race_finished.tolist() == [True, False, False, False]
     assert env.reset_terminated.tolist() == [True, True, False, True]
     assert env.reset_time_outs.tolist() == [False, False, True, False]
     torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([100, 0, 0, 0.0]))
-    torch.testing.assert_close(env._episode_sums["termination"], torch.tensor([0, -25, 0, -25.0]))
+    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([0, -0.5, 0, -0.5]))
     env._get_rewards()  # repeated accounting cannot pay a terminal event again
     torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([100, 0, 0, 0.0]))
-    torch.testing.assert_close(env._episode_sums["termination"], torch.tensor([0, -25, 0, -25.0]))
+    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([0, -1.0, 0, -1.0]))
     env._reset_idx(None)
     logs = env.extras["log"]
     assert logs["Episode_Race/success_rate"] == 0.25
     assert logs["Episode_Race/fall_rate"] == 0.5
     assert logs["Episode_Race/timeout_rate"] == 0.25
-    assert logs["Episode_Race/finish_time_s"] == 90
+    assert logs["Episode_Race/finish_time_s"] == 30
 
 
-def test_fence_contact_and_lateral_drift_do_not_terminate(env):
+def test_fence_contact_does_not_terminate_but_fall_does(env):
     env._contact_sensor.data.net_normal_forces_w_history.torch[:, :, 2, :] = 1000
     advance(env, [10, 2.5])
     assert not env.reset_terminated.any()
@@ -160,6 +161,7 @@ def test_fence_contact_and_lateral_drift_do_not_terminate(env):
     env._robot.data.root_pos_w.torch[2, 2] = 0.1
     env.reset_terminated[:], env.reset_time_outs[:] = env._get_dones()
     assert env.reset_terminated.tolist() == [True, True, True, False]
+    assert env._race_fell.tolist() == [True, True, True, False]
 
 
 @pytest.mark.parametrize("bad", [None, torch.zeros(4, 3, 1, 0, 3), torch.zeros(4, 3)])
@@ -176,24 +178,25 @@ def test_missing_ground_filter_fails_loudly(env, bad):
 def test_distance_rewards_net_progress_and_event_scale(modules, dt):
     env = make_env(modules, num_envs=1, terrain_mode="race")
     env.step_dt = dt
+    env.max_episode_length = round(30 / dt)
     total = 0
     for x in [1, 1, 0, -2, 0, 10]:
         total += advance(env, [x, 0]).item()
     assert total == pytest.approx(50 - 0.1 * dt * 6)
-    # Full overshoot earns exactly the remaining 20 m, and the bonus is independent of dt.
+    # Full overshoot earns exactly the remaining 40 m, and the bonus is independent of dt.
     env.episode_length_buf[:] = round(30 / dt) - 1
-    reward = advance(env, [35, 0]).item()
-    assert reward == pytest.approx(100 + 100 + 50 * (1 - 30 / 90) - 0.1 * dt, abs=3e-5)
+    reward = advance(env, [55, 0]).item()
+    assert reward == pytest.approx(200 + 100 - 0.1 * dt, abs=3e-5)
 
 
 def test_faster_finish_beats_slow_and_falling(modules):
     env = make_env(modules, terrain_mode="race")
-    env.episode_length_buf[:] = torch.tensor([1500, 3000, 4499, 1])
+    env.episode_length_buf[:] = torch.tensor([499, 999, 1499, 1])
     env._robot.data.projected_gravity_b.torch[3, 2] = 0
-    reward = advance(env, [30, 0])
+    reward = advance(env, [50, 0])
     assert reward[0] > reward[1] > reward[2] > reward[3]
     # Waiting at the starting line until timeout costs less than intentionally falling at once.
-    assert -0.1 * env.cfg.race_episode_length_s > env.cfg.rewards.race_weights["termination"]
+    assert -0.1 * env.cfg.race_episode_length_s > env.cfg.rewards.race_weights["unsafe_state"]
 
 
 @pytest.mark.parametrize("stage1", [False, True])
@@ -209,14 +212,14 @@ def test_observations_commands_and_reward_immutability(modules, stage1):
     torch.testing.assert_close(obs[:, 86:123], env._actions)
     before = tensors_in(env)
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    assert len(terms) == 21 and terms.keys() == env.cfg.rewards.race_weights.keys()
+    assert len(terms) == 24 and terms.keys() == env.cfg.rewards.race_weights.keys()
     for value in terms.values():
         assert value.shape == (4,) and torch.isfinite(value).all()
     after = tensors_in(env)
     assert before.keys() == after.keys()
     for key in before:
         torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
-    assert "lateral_drift_l2" not in terms and "lin_vel_z_l2" not in terms
+    assert "lateral_drift_l2" in terms and "lin_vel_z_l2" in terms
 
 
 def test_missing_race_weight_is_rejected(env):
@@ -230,8 +233,9 @@ def test_fence_contact_threshold_and_per_environment_isolation(env, modules, for
     matrix = env._fence_contact_sensor.data.normal_force_matrix_w_history.torch
     matrix[1, 0, 2, 1, 1] = force
     before = matrix.clone()
+    env._get_dones()
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    torch.testing.assert_close(terms["fence_contact"], torch.tensor([0.0, expected, 0.0, 0.0]))
+    torch.testing.assert_close(terms["unsafe_state"], torch.tensor([0.0, expected, 0.0, 0.0]))
     torch.testing.assert_close(matrix, before)
 
 
@@ -240,23 +244,92 @@ def test_fence_penalty_is_time_scaled_and_not_multiplied_by_contacts(env, module
     matrix = env._fence_contact_sensor.data.normal_force_matrix_w_history.torch
     matrix[0, 0, 0, 0, 1] = 10
     matrix[1, :, :, :, 1] = -10
-    torch.testing.assert_close(env._get_rewards() - baseline, torch.tensor([-0.04, -0.04, 0.0, 0.0]))
+    env._get_dones()
+    torch.testing.assert_close(env._get_rewards() - baseline, torch.tensor([-0.5, -0.5, 0.0, 0.0]))
     assert not env._get_dones()[0].any()  # Fence contact alone is a penalty, not a fall.
     env.step_dt = 0.01
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    penalty = terms["fence_contact"] * env.cfg.rewards.race_weights["fence_contact"] * env.step_dt
-    torch.testing.assert_close(penalty, torch.tensor([-0.02, -0.02, 0.0, 0.0]))
+    penalty = terms["unsafe_state"] * env.cfg.rewards.race_weights["unsafe_state"] * env.step_dt
+    torch.testing.assert_close(penalty, torch.tensor([-0.25, -0.25, 0.0, 0.0]))
     matrix.zero_()
-    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["fence_contact"].any()
+    env._get_dones()
+    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["unsafe_state"].any()
 
 
 def test_ground_contacts_do_not_create_fence_penalty(env, modules):
     env._contact_sensor.data.net_normal_forces_w_history.torch[:] = 100
-    env._torso_ground_sensor.data.normal_force_matrix_w_history.torch[:] = 100
-    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["fence_contact"].any()
+    env._get_dones()
+    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["unsafe_state"].any()
 
 
 def test_missing_fence_matrix_is_not_silently_ignored(env, modules):
     env._fence_contact_sensor.data.normal_force_matrix_w_history = None
     with pytest.raises(RuntimeError, match="fence contact filter"):
-        modules.rewards.compute_rewards(env, env.cfg.rewards)
+        env._get_dones()
+
+
+def test_unsafe_crossing_requires_reentry_but_recovery_can_finish(env):
+    env._race_previous_xy[:, 0] = 49
+    env._torso_ground_sensor.data.normal_force_matrix_w_history.torch[0, :, 0, 0, 2] = 5
+    env._fence_contact_sensor.data.normal_force_matrix_w_history.torch[1:3, :, 0, 0, 1] = 5
+    env._robot.data.projected_gravity_b.torch[2, 2] = 0
+    advance(env, [51, 0])
+    assert env._race_finished.tolist() == [False, False, False, True]
+    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-0.5, -0.5, -0.5, 0.0]))
+    env._torso_ground_sensor.data.normal_force_matrix_w_history.torch.zero_()
+    env._fence_contact_sensor.data.normal_force_matrix_w_history.torch.zero_()
+    env._robot.data.projected_gravity_b.torch[:, 2] = -1
+    advance(env, [52, 0])  # recovery beyond the line cannot retroactively finish
+    assert env._race_finished.tolist() == [False, False, False, True]
+    advance(env, [49, 0])
+    advance(env, [50, 0])
+    assert env._race_finished.all()
+    assert env._race_ever_fell.tolist() == [True, False, True, False]
+    assert env._race_ever_fence.tolist() == [False, True, True, False]
+    torch.testing.assert_close(env._race_sums["unsafe_seconds"], torch.tensor([0.02, 0.02, 0.02, 0.0]))
+    torch.testing.assert_close(env._episode_sums["finish_bonus"][:3], torch.full((3,), 500 - 400 * 0.08 / 30))
+    env._reset_idx(None)
+    assert env.extras["race_episode"]["success"].all()
+    assert env.extras["race_episode"]["fell"].tolist() == [True, False, True, False]
+
+
+@pytest.mark.parametrize("dt", [0.01, 0.02, 0.04])
+def test_full_accident_duration_and_recovery(dt, modules):
+    env = make_env(modules, terrain_mode="race")
+    env.step_dt = dt
+    # World 0 falls, 1 hits the fence, 2 does both, 3 remains safe for one second.
+    env._robot.data.projected_gravity_b.torch[[0, 2], 2] = 0
+    env._fence_contact_sensor.data.normal_force_matrix_w_history.torch[[1, 2], :, 0, 0, 0] = 5
+    for _ in range(round(1 / dt)):
+        advance(env, [0, 0])
+    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-25, -25, -25, 0.0]))
+    env._robot.data.projected_gravity_b.torch[:, 2] = -1
+    env._fence_contact_sensor.data.normal_force_matrix_w_history.torch.zero_()
+    for _ in range(round(1 / dt)):
+        advance(env, [0, 0])
+    torch.testing.assert_close(env._episode_sums["unsafe_state"], torch.tensor([-25, -25, -25, 0.0]))
+    assert not env.reset_terminated.any()
+
+
+def test_complete_trajectories_favor_straight_and_corrective_yaw(modules):
+    env = make_env(modules, terrain_mode="race")
+    total = torch.zeros(4)
+    for step in range(1, 101):
+        t = step * env.step_dt
+        xy = torch.tensor([[t, 0], [t, 0.2 * t], [t, 0], [0, 0]])
+        env._robot.data.root_lin_vel_w.torch[1, 1] = 0.2
+        env._robot.data.heading_w.torch[2] = 0.2 * t
+        total += advance(env, xy)
+    assert total[0] > total[1] and total[0] > total[2] and total[0] > total[3]
+    torch.testing.assert_close(env._episode_sums["forward_progress"], torch.tensor([10, 10, 10, 0.0]))
+    env._commands[:, 2] = -0.5
+    env._robot.data.root_ang_vel_w.torch[:, 2] = torch.tensor([-0.5, 0.0, 0.5, -0.5])
+    terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
+    assert terms["yaw_rate_error_l2"][0] < terms["yaw_rate_error_l2"][1] < terms["yaw_rate_error_l2"][2]
+
+
+def test_late_crossing_after_deadline_is_timeout(env):
+    env.episode_length_buf[:] = env.max_episode_length
+    advance(env, [50, 0])
+    assert not env.reset_terminated.any() and env.reset_time_outs.all()
+    assert not env._episode_sums["finish_bonus"].any()
