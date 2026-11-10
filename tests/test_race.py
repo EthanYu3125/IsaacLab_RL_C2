@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,13 @@ def test_configuration_and_legacy_isolation(modules, stage1, play_order):
     assert cfg.scene.race_track.prim_path == "{ENV_REGEX_NS}/RaceTrack"
     assert Path(cfg.scene.race_track.spawn.usd_path).is_absolute()
     assert cfg.sim.physics.solver_cfg.use_mujoco_contacts
+    assert cfg.scene.fence_contact.prim_path == "{ENV_REGEX_NS}/Robot/.*"
+    pattern = cfg.scene.fence_contact.filter_shape_prim_expr[0].replace("{ENV_REGEX_NS}", "/World/envs/env_.*")
+    for side in ("Left", "Right"):
+        for kind in ("Post", "Rail"):
+            assert re.fullmatch(pattern, f"/World/envs/env_0/RaceTrack/{side}_{kind}_0")
+    assert not re.fullmatch(pattern, "/World/ground/terrain/mesh")
+    assert not re.fullmatch(pattern, "/World/envs/env_0/RaceTrack/Finish_0_0")
     assert cfg.scene.torso_ground_contact.filter_shape_prim_expr == ["/World/ground/terrain/.*"]
     assert cfg.scene.height_scanner.global_world_only
     assert cfg.scene.height_scanner.mesh_prim_paths == ["/World/ground"]
@@ -63,6 +71,7 @@ def test_configuration_and_legacy_isolation(modules, stage1, play_order):
     legacy.configure_stage1()
     assert legacy.episode_length_s == 20 and legacy.scene.env_spacing == 2.5
     assert legacy.scene.race_track is None and legacy.scene.torso_ground_contact is None
+    assert legacy.scene.fence_contact is None
     assert not legacy.sim.physics.default.solver_cfg.use_mujoco_contacts
 
 
@@ -200,7 +209,7 @@ def test_observations_commands_and_reward_immutability(modules, stage1):
     torch.testing.assert_close(obs[:, 86:123], env._actions)
     before = tensors_in(env)
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
-    assert len(terms) == 20 and terms.keys() == env.cfg.rewards.race_weights.keys()
+    assert len(terms) == 21 and terms.keys() == env.cfg.rewards.race_weights.keys()
     for value in terms.values():
         assert value.shape == (4,) and torch.isfinite(value).all()
     after = tensors_in(env)
@@ -214,3 +223,40 @@ def test_missing_race_weight_is_rejected(env):
     del env.cfg.rewards.race_weights["time_cost"]
     with pytest.raises(KeyError, match="race_weights"):
         env._get_rewards()
+
+
+@pytest.mark.parametrize("force,expected", [(0.0, 0.0), (0.99, 0.0), (1.0, 0.0), (1.01, 1.0), (-5.0, 1.0)])
+def test_fence_contact_threshold_and_per_environment_isolation(env, modules, force, expected):
+    matrix = env._fence_contact_sensor.data.normal_force_matrix_w_history.torch
+    matrix[1, 0, 2, 1, 1] = force
+    before = matrix.clone()
+    terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
+    torch.testing.assert_close(terms["fence_contact"], torch.tensor([0.0, expected, 0.0, 0.0]))
+    torch.testing.assert_close(matrix, before)
+
+
+def test_fence_penalty_is_time_scaled_and_not_multiplied_by_contacts(env, modules):
+    baseline = env._get_rewards()
+    matrix = env._fence_contact_sensor.data.normal_force_matrix_w_history.torch
+    matrix[0, 0, 0, 0, 1] = 10
+    matrix[1, :, :, :, 1] = -10
+    torch.testing.assert_close(env._get_rewards() - baseline, torch.tensor([-0.04, -0.04, 0.0, 0.0]))
+    assert not env._get_dones()[0].any()  # Fence contact alone is a penalty, not a fall.
+    env.step_dt = 0.01
+    terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
+    penalty = terms["fence_contact"] * env.cfg.rewards.race_weights["fence_contact"] * env.step_dt
+    torch.testing.assert_close(penalty, torch.tensor([-0.02, -0.02, 0.0, 0.0]))
+    matrix.zero_()
+    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["fence_contact"].any()
+
+
+def test_ground_contacts_do_not_create_fence_penalty(env, modules):
+    env._contact_sensor.data.net_normal_forces_w_history.torch[:] = 100
+    env._torso_ground_sensor.data.normal_force_matrix_w_history.torch[:] = 100
+    assert not modules.rewards.compute_rewards(env, env.cfg.rewards)["fence_contact"].any()
+
+
+def test_missing_fence_matrix_is_not_silently_ignored(env, modules):
+    env._fence_contact_sensor.data.normal_force_matrix_w_history = None
+    with pytest.raises(RuntimeError, match="fence contact filter"):
+        modules.rewards.compute_rewards(env, env.cfg.rewards)

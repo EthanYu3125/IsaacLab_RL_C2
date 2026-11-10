@@ -105,11 +105,13 @@ class RewardsCfg:
         "feet_slide": -0.1,
         "forward_progress": 5.0,
         "time_cost": -0.1,
+        "fence_contact": -2.0,  # per second of detected fence contact, independent of body/contact count
         "finish_bonus": 100.0,
         "heading_error_l2": -0.2,
         "lateral_velocity_l2": -0.1,
     }
     race_finish_time_bonus_fraction = 0.5  # adds at most 50 to the default 100 finish reward
+    race_fence_contact_force_threshold = 1.0  # [N], ignore tiny contact-force noise
 
     def stage1_weight(self, name: str, terrain_mode: str) -> float | None:
         """Resolve the effective weight without mutating the configured plane weights."""
@@ -196,6 +198,18 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     }
 
     if env.cfg.terrain_mode == "race":
+        matrix = env._fence_contact_sensor.data.normal_force_matrix_w_history
+        if matrix is None:
+            raise RuntimeError("Race fence contact filter returned no force matrix; refusing unfiltered fallback")
+        fence_forces = matrix.torch
+        if (
+            fence_forces.ndim != 5
+            or fence_forces.shape[0] != env.num_envs
+            or min(fence_forces.shape[1:4]) == 0
+            or fence_forces.shape[-1] != 3
+        ):
+            raise RuntimeError(f"Unexpected fence-filtered contact shape: {tuple(fence_forces.shape)}")
+        fence_contact = (fence_forces.norm(dim=-1) > cfg.race_fence_contact_force_threshold).flatten(1).any(dim=1)
         position = env._race_position()
         length = env.cfg.race_track_length
         progress = position[:, 0].clamp(0, length) - env._race_previous_xy[:, 0].clamp(0, length)
@@ -208,6 +222,7 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
                 "termination": (env._race_fell & unpaid).float() / env.step_dt,
                 "forward_progress": progress / env.step_dt,
                 "time_cost": torch.ones_like(progress),
+                "fence_contact": fence_contact.float(),
                 "finish_bonus": (env._race_finished & ~env._race_fell & unpaid).float()
                 * (1.0 + cfg.race_finish_time_bonus_fraction * speed_bonus)
                 / env.step_dt,

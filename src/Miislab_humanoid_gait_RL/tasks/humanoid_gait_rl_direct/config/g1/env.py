@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-import math
 import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -78,6 +78,7 @@ class HumanoidGaitRlEnv(RaceLifecycleMixin, DirectRLEnv):
         self._init_reset_line_buffers()
         if self._race_mode:
             self._torso_ground_sensor = self.scene["torso_ground_contact"]
+            self._fence_contact_sensor = self.scene["fence_contact"]
             self._init_race_buffers()
             # Upstream dumps its config before gym.make; preserve the effective late-applied race settings too.
             if getattr(self.cfg, "log_dir", None):

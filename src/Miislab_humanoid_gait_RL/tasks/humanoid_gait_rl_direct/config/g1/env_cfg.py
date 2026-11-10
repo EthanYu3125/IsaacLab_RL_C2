@@ -108,6 +108,7 @@ class HumanoidGaitRlSceneCfg(InteractiveSceneCfg):
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
     race_track: AssetBaseCfg | None = None
     torso_ground_contact: ContactSensorCfg | None = None
+    fence_contact: ContactSensorCfg | None = None
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
         spawn=sim_utils.DomeLightCfg(
@@ -256,6 +257,7 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         spec = TrackSpec(self.race_track_length, self.race_track_width)
         for name, value in (
             ("race_episode_length_s", self.race_episode_length_s),
+            ("race_fence_contact_force_threshold", self.rewards.race_fence_contact_force_threshold),
             ("tracking_std", self.rewards.tracking_std),
             ("stage1_lin_vel_x", self.stage1_lin_vel_x),
             ("stage1_max_yaw_rate", self.stage1_max_yaw_rate),
@@ -271,7 +273,14 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
             physics = physics.default
         if not isinstance(physics, NewtonCfg) or not isinstance(physics.solver_cfg, MJWarpSolverCfg):
             raise ValueError("Race mode requires Newton MJWarp for ground-only shape contact filtering")
-        self.sim.physics = replace(physics, solver_cfg=replace(physics.solver_cfg, use_mujoco_contacts=True))
+        # replace() passes existing fields back to __init__; Newton must derive class_type again.
+        # MuJoCo handles collisions internally, so the Newton collision pipeline must be unset.
+        self.sim.physics = replace(
+            physics,
+            class_type=None,
+            collision_cfg=None,
+            solver_cfg=replace(physics.solver_cfg, use_mujoco_contacts=True),
+        )
 
         self.episode_length_s = self.race_episode_length_s
         self.terrain_curriculum = False
@@ -292,6 +301,11 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
         self.scene.torso_ground_contact = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/torso_link",
             filter_shape_prim_expr=["/World/ground/terrain/.*"],
+            history_length=3,
+        )
+        self.scene.fence_contact = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/.*",
+            filter_shape_prim_expr=["{ENV_REGEX_NS}/RaceTrack/(Left|Right)_(Post|Rail)_.*"],
             history_length=3,
         )
         self.scene.contact_forces.force_threshold = self.rewards.feet_contact_force_threshold

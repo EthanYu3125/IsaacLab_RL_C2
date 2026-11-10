@@ -327,6 +327,9 @@ def make_env(modules, num_envs=4, stage1=True, terrain_mode=None):
     env._init_reset_line_buffers()
     env._reset_line_state(torch.arange(num_envs), env._robot.data.default_root_pose.torch.clone())
     if terrain_mode == "race":
+        env._fence_contact_sensor = SimpleNamespace(
+            data=SimpleNamespace(normal_force_matrix_w_history=proxy(torch.zeros(num_envs, 3, 3, 2, 3)))
+        )
         env._torso_ground_sensor = SimpleNamespace(
             data=SimpleNamespace(normal_force_matrix_w_history=proxy(torch.zeros(num_envs, 3, 1, 1, 3)))
         )
