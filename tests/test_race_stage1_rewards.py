@@ -18,38 +18,17 @@ def modules():
         yield load_task_modules(patch)
 
 
-def test_complete_attachment_weight_profile_is_copied_independently(modules):
-    expected = {
-        "termination": -400.0,
-        "track_lin_vel_xy_exp": 0.0,
-        "track_ang_vel_z_exp": 0.0,
-        "ang_vel_xy_l2": -0.2,
-        "flat_orientation_l2": -4.0,
-        "dof_torques_l2": -1.5e-7,
-        "dof_acc_l2": -1.25e-7,
-        "action_rate_l2": -0.005,
-        "dof_pos_limits": -1.0,
-        "joint_deviation_hip": -0.1,
-        "joint_deviation_arms": -0.02,
-        "joint_deviation_fingers": -0.005,
-        "joint_deviation_torso": -0.1,
-        "feet_air_time": 0.0,
-        "feet_slide": -0.5,
-        "forward_progress": 5.0,
-        "lateral_drift_l2": -2.4,
-        "heading_error_l2": -2.2,
-        "lateral_velocity_l2": -2.2,
-        "yaw_rate_error_l2": -0.2,
-        "lin_vel_z_l2": -0.5,
-    }
+def test_stage1_weight_profile_is_copied_independently_with_race_only_bonus(modules):
     first, second = modules.rewards.RewardsCfg(), modules.rewards.RewardsCfg()
-    assert first.race_weights == first.stage1_weights == expected
+    expected = dict(first.stage1_weights)
+    assert len(expected) == 21 and "finish_bonus" not in expected
+    assert first.race_weights == {**expected, "finish_bonus": 300.0}
     assert first.race_weights is not first.stage1_weights
     first.race_weights["forward_progress"] = 17
     first.stage1_weights["feet_slide"] = -9
     assert first.stage1_weights["forward_progress"] == 5
     assert first.race_weights["feet_slide"] == -0.5
-    assert second.race_weights == expected
+    assert second.race_weights == {**expected, "finish_bonus": 300.0}
     assert not hasattr(first, "race_finish_time_discount")
 
 
@@ -103,20 +82,25 @@ def test_all_terms_and_aggregates_match_stage1_for_equivalent_states(modules, st
     race._race_fell[1], race._race_fence[2], race._race_finished[0] = True, True, True
     race.reset_terminated[:] = race._race_fell | race._race_fence | race._race_finished
     race.reset_time_outs[3] = True
+    race.episode_length_buf[:] = round(10 / dt)
 
     before = tensors_in(race)
     expected = modules.rewards.compute_rewards(legacy, legacy.cfg.rewards)
     actual = modules.rewards.compute_rewards(race, race.cfg.rewards)
-    assert len(actual) == 21 and actual.keys() == expected.keys() == race.cfg.rewards.race_weights.keys()
+    assert len(actual) == 22 and actual.keys() == race.cfg.rewards.race_weights.keys()
+    assert actual.keys() - expected.keys() == {"finish_bonus"}
     for name in actual:
         assert actual[name].shape == (4,) and actual[name].dtype == torch.float32
         assert torch.isfinite(actual[name]).all()
-        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0, msg=name)
+        if name != "finish_bonus":
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0, msg=name)
     after = tensors_in(race)
     assert before.keys() == after.keys()
     for name in before:
         torch.testing.assert_close(before[name], after[name], rtol=0, atol=0, msg=name)
-    torch.testing.assert_close(race._get_rewards(), legacy._get_rewards(), rtol=0, atol=0)
+    bonus = actual["finish_bonus"] * race.cfg.rewards.race_weights["finish_bonus"] * dt
+    torch.testing.assert_close(bonus, torch.tensor([30.0, 0, 0, 0]))
+    torch.testing.assert_close(race._get_rewards(), legacy._get_rewards() + bonus)
     # Plain race floor keeps the full vertical-motion cost.
     assert race.cfg.rewards.race_weights["lin_vel_z_l2"] == -0.5
 
@@ -142,7 +126,8 @@ def test_reset_teleport_and_finish_location_cannot_generate_progress_reward(modu
     env._robot.data.root_lin_vel_w.torch[:] = 0
     terms = modules.rewards.compute_rewards(env, env.cfg.rewards)
     assert not terms["forward_progress"].any()  # both the reset teleport and standing far away yield zero
-    assert not {"unsafe_state", "time_cost", "finish_bonus"} & terms.keys()
+    assert not {"unsafe_state", "time_cost"} & terms.keys()
+    assert not terms["finish_bonus"].any()
 
 
 @pytest.mark.parametrize("mode", ["finish", "timeout", "fall", "fence", "fall_and_fence"])
@@ -158,6 +143,8 @@ def test_failure_penalty_is_only_for_failure_and_excludes_successful_termination
     env.reset_terminated[:], env.reset_time_outs[:] = env._get_dones()
     env._get_rewards()
     failed = mode in ("fall", "fence", "fall_and_fence")
-    assert env._episode_sums["termination"].item() == (-8 if failed else 0)
+    penalty = env.cfg.rewards.race_weights["termination"] * env.step_dt
+    assert env._episode_sums["termination"].item() == pytest.approx(penalty if failed else 0)
+    assert env._episode_sums["finish_bonus"].item() == pytest.approx(10 if mode == "finish" else 0)
     assert env.reset_terminated.item() == (failed or mode == "finish")
     assert env.reset_time_outs.item() == (mode == "timeout")

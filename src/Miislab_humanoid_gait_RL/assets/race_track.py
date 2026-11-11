@@ -9,8 +9,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-RACE_TRACK_LENGTH = 25.0
-RACE_TRACK_WIDTH = 2.5
+RACE_TRACK_LENGTH = 50.0
+RACE_TRACK_WIDTH = 2.4
 BUFFER_LENGTH = 2.0
 FENCE_THICKNESS = 0.12
 COLORS = {"floor": "DCAAA0", "fence": "E9B51D", "white": "FFFFFF", "black": "151515"}

@@ -57,7 +57,7 @@ class RewardsCfg:
     # terms available, but disable command tracking and in-place stepping bonuses.
     # The scalar weights above preserve the original stage1=False task.
     stage1_weights: dict[str, float] = {
-        "termination": -400.0,
+        "termination": -450.0,
         "track_lin_vel_xy_exp": 0.0,
         "track_ang_vel_z_exp": 0.0,
         "ang_vel_xy_l2": -0.3,
@@ -73,9 +73,9 @@ class RewardsCfg:
         "feet_air_time": 0.0,
         "feet_slide": -0.5,
         "forward_progress": 5.0,
-        "lateral_drift_l2": -2.8,  # modestly tighten the path for continuation training
+        "lateral_drift_l2": -3,  # modestly tighten the path for continuation training
         "heading_error_l2": -2.5,
-        "lateral_velocity_l2": -2.5,
+        "lateral_velocity_l2": -3,
         "yaw_rate_error_l2": -0.5,
         "lin_vel_z_l2": -0.5,
     }
@@ -86,9 +86,9 @@ class RewardsCfg:
     # Uphill/downhill motion is necessary on rough terrain. Raw terms remain unchanged.
     stage1_rough_weight_overrides: dict[str, float] = {"lin_vel_z_l2": 0.0}
 
-    # Race uses the complete flat Stage 1 profile, independently editable after configuration.
+    # Race uses the flat Stage 1 profile plus a one-time 300 / finish_seconds bonus.
     # Rough-terrain overrides do not apply to the flat race floor.
-    race_weights: dict[str, float] = dict(stage1_weights)
+    race_weights: dict[str, float] = {**stage1_weights, "finish_bonus": 300.0}
     race_fence_contact_force_threshold = 1.0  # [N]
 
     def stage1_weight(self, name: str, terrain_mode: str) -> float | None:
@@ -179,6 +179,10 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     if is_race:
         # Race terminates on success too; only falls/fence collisions incur the Stage 1 failure cost.
         rewards["termination"] = (env._race_fell | env._race_fence).float()
+        finished_now = env._race_finished & ~env._race_terminal_paid & ~env._race_fell & ~env._race_fence
+        finish_seconds = env.episode_length_buf.float().clamp_min(1) * env.step_dt
+        # Aggregation multiplies by weight and step_dt; cancel dt for a one-time event reward.
+        rewards["finish_bonus"] = finished_now.float() / (finish_seconds * env.step_dt)
     if env.cfg.stage1 or is_race:
         # The direction and origin are captured at reset; turning does not rotate this line.
         heading = env._target_heading
