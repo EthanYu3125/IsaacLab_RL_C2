@@ -22,13 +22,15 @@ def test_stage1_weight_profile_is_copied_independently_with_race_only_bonus(modu
     first, second = modules.rewards.RewardsCfg(), modules.rewards.RewardsCfg()
     expected = dict(first.stage1_weights)
     assert len(expected) == 21 and "finish_bonus" not in expected
-    assert first.race_weights == {**expected, "finish_bonus": 300.0}
+    finish_weight = first.race_weights["finish_bonus"]
+    assert finish_weight > 0
+    assert first.race_weights == {**expected, "finish_bonus": finish_weight}
     assert first.race_weights is not first.stage1_weights
     first.race_weights["forward_progress"] = 17
     first.stage1_weights["feet_slide"] = -9
     assert first.stage1_weights["forward_progress"] == 5
     assert first.race_weights["feet_slide"] == -0.5
-    assert second.race_weights == {**expected, "finish_bonus": 300.0}
+    assert second.race_weights == {**expected, "finish_bonus": finish_weight}
     assert not hasattr(first, "race_finish_time_discount")
 
 
@@ -83,6 +85,11 @@ def test_all_terms_and_aggregates_match_stage1_for_equivalent_states(modules, st
     race.reset_terminated[:] = race._race_fell | race._race_fence | race._race_finished
     race.reset_time_outs[3] = True
     race.episode_length_buf[:] = round(10 / dt)
+    # Supply a valid crossing segment for the synthetic successful terminal state.
+    race._race_previous_xy[0] = race._race_position()[0]
+    race._race_previous_xy[0, 0] = race._race_lengths[0] - 1
+    race._robot.data.root_pos_w.torch[0, 0] = race._race_track_origins[0, 0] + race._race_lengths[0]
+    legacy._robot.data.root_pos_w.torch[0, 0] = race._robot.data.root_pos_w.torch[0, 0] - translation[0]
 
     before = tensors_in(race)
     expected = modules.rewards.compute_rewards(legacy, legacy.cfg.rewards)
@@ -99,7 +106,7 @@ def test_all_terms_and_aggregates_match_stage1_for_equivalent_states(modules, st
     for name in before:
         torch.testing.assert_close(before[name], after[name], rtol=0, atol=0, msg=name)
     bonus = actual["finish_bonus"] * race.cfg.rewards.race_weights["finish_bonus"] * dt
-    torch.testing.assert_close(bonus, torch.tensor([30.0, 0, 0, 0]))
+    torch.testing.assert_close(bonus, torch.tensor([race.cfg.rewards.race_weights["finish_bonus"] / 10, 0, 0, 0]))
     torch.testing.assert_close(race._get_rewards(), legacy._get_rewards() + bonus)
     # Plain race floor keeps the full vertical-motion cost.
     assert race.cfg.rewards.race_weights["lin_vel_z_l2"] == -0.5
@@ -145,6 +152,7 @@ def test_failure_penalty_is_only_for_failure_and_excludes_successful_termination
     failed = mode in ("fall", "fence", "fall_and_fence")
     penalty = env.cfg.rewards.race_weights["termination"] * env.step_dt
     assert env._episode_sums["termination"].item() == pytest.approx(penalty if failed else 0)
-    assert env._episode_sums["finish_bonus"].item() == pytest.approx(10 if mode == "finish" else 0)
+    bonus = env.cfg.rewards.race_weights["finish_bonus"] / 30
+    assert env._episode_sums["finish_bonus"].item() == pytest.approx(bonus if mode == "finish" else 0)
     assert env.reset_terminated.item() == (failed or mode == "finish")
     assert env.reset_time_outs.item() == (mode == "timeout")

@@ -57,14 +57,14 @@ class RewardsCfg:
     # terms available, but disable command tracking and in-place stepping bonuses.
     # The scalar weights above preserve the original stage1=False task.
     stage1_weights: dict[str, float] = {
-        "termination": -450.0,
+        "termination": -400.0,
         "track_lin_vel_xy_exp": 0.0,
         "track_ang_vel_z_exp": 0.0,
-        "ang_vel_xy_l2": -0.3,
+        "ang_vel_xy_l2": -0.35,
         "flat_orientation_l2": -4.0,
         "dof_torques_l2": -1.5e-7,
         "dof_acc_l2": -1.25e-7,
-        "action_rate_l2": -0.005,
+        "action_rate_l2": -0.0075,
         "dof_pos_limits": -1.0,
         "joint_deviation_hip": -0.1,
         "joint_deviation_arms": -0.02,
@@ -73,10 +73,10 @@ class RewardsCfg:
         "feet_air_time": 0.0,
         "feet_slide": -0.5,
         "forward_progress": 5.0,
-        "lateral_drift_l2": -3,  # modestly tighten the path for continuation training
-        "heading_error_l2": -2.5,
-        "lateral_velocity_l2": -3,
-        "yaw_rate_error_l2": -0.5,
+        "lateral_drift_l2": -5,  # modestly tighten the path for continuation training
+        "heading_error_l2": -4,
+        "lateral_velocity_l2": -4,
+        "yaw_rate_error_l2": -0.6,
         "lin_vel_z_l2": -0.5,
     }
     # Retained only for the environment's landing statistics; they do not affect rewards.
@@ -86,9 +86,9 @@ class RewardsCfg:
     # Uphill/downhill motion is necessary on rough terrain. Raw terms remain unchanged.
     stage1_rough_weight_overrides: dict[str, float] = {"lin_vel_z_l2": 0.0}
 
-    # Race uses the flat Stage 1 profile plus a one-time 300 / finish_seconds bonus.
+    # Race adds a one-time weight / finish_seconds bonus for finishing in the central 60% of the lane.
     # Rough-terrain overrides do not apply to the flat race floor.
-    race_weights: dict[str, float] = {**stage1_weights, "finish_bonus": 300.0}
+    race_weights: dict[str, float] = {**stage1_weights, "finish_bonus": 600.0}
     race_fence_contact_force_threshold = 1.0  # [N]
 
     def stage1_weight(self, name: str, terrain_mode: str) -> float | None:
@@ -180,6 +180,12 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
         # Race terminates on success too; only falls/fence collisions incur the Stage 1 failure cost.
         rewards["termination"] = (env._race_fell | env._race_fence).float()
         finished_now = env._race_finished & ~env._race_terminal_paid & ~env._race_fell & ~env._race_fence
+        # Use the root's interpolated position at the finish line, relative to each lane's center.
+        xy, previous = env._race_position(), env._race_previous_xy
+        dx = xy[:, 0] - previous[:, 0]
+        alpha = (env._race_lengths - previous[:, 0]) / torch.where(dx > 0, dx, torch.ones_like(dx))
+        crossing_y = previous[:, 1] + alpha * (xy[:, 1] - previous[:, 1])
+        finished_now &= crossing_y.abs() <= 0.3 * env._race_widths
         finish_seconds = env.episode_length_buf.float().clamp_min(1) * env.step_dt
         # Aggregation multiplies by weight and step_dt; cancel dt for a one-time event reward.
         rewards["finish_bonus"] = finished_now.float() / (finish_seconds * env.step_dt)

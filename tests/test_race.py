@@ -33,6 +33,10 @@ def advance(env, xy, steps=1):
     return env._get_rewards()
 
 
+def finish_bonus(env, seconds):
+    return env.cfg.rewards.race_weights["finish_bonus"] / seconds
+
+
 @pytest.mark.parametrize("stage1", [True, False])
 @pytest.mark.parametrize("play_order", ["before", "after", None])
 def test_configuration_and_legacy_isolation(modules, stage1, play_order):
@@ -139,7 +143,7 @@ def test_finish_fall_timeout_precedence_and_event_rewards(env):
     assert env._race_finished.tolist() == [True, False, False, False]
     assert env.reset_terminated.tolist() == [True, True, False, True]
     assert env.reset_time_outs.tolist() == [False, False, True, False]
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([10.0, 0, 0, 0]))
+    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([finish_bonus(env, 30), 0, 0, 0]))
     torch.testing.assert_close(
         env._episode_sums["termination"],
         torch.tensor([0, 1, 0, 1]) * env.cfg.rewards.race_weights["termination"] * env.step_dt,
@@ -186,7 +190,7 @@ def test_forward_reward_uses_signed_uncapped_velocity_and_stage1_time_scale(modu
     # The finish event bonus is added to the unchanged velocity-based motion reward.
     env.episode_length_buf[:] = round(30 / dt) - 1
     reward = advance(env, [55, 0]).item()
-    assert reward == pytest.approx(15 * dt + 300 / 30)
+    assert reward == pytest.approx(15 * dt + finish_bonus(env, 30))
 
 
 def test_faster_finish_earns_larger_bonus_and_failure_is_penalized(modules):
@@ -194,7 +198,9 @@ def test_faster_finish_earns_larger_bonus_and_failure_is_penalized(modules):
     env.episode_length_buf[:] = torch.tensor([499, 999, 1499, 1])
     env._robot.data.projected_gravity_b.torch[3, 2] = 0
     reward = advance(env, [50, 0])
-    torch.testing.assert_close(reward[:3], torch.tensor([30.0, 15.0, 10.0]) + 5 * 0.5 * env.step_dt)
+    torch.testing.assert_close(
+        reward[:3], torch.tensor([finish_bonus(env, t) for t in (10, 20, 30)]) + 5 * 0.5 * env.step_dt
+    )
     assert reward[3] < reward[0]
     torch.testing.assert_close(
         env._episode_sums["termination"],
@@ -210,7 +216,7 @@ def test_finish_bonus_is_once_per_episode_and_independent_of_control_dt(modules,
     env.max_episode_length = round(30 / dt)
     env.episode_length_buf[:] = round(seconds / dt) - 1
     advance(env, [env._race_lengths.item(), 0])
-    expected = torch.tensor([300 / seconds])
+    expected = torch.tensor([finish_bonus(env, seconds)])
     torch.testing.assert_close(env._episode_sums["finish_bonus"], expected)
     # Re-evaluating the same terminal state cannot pay again, even if done detection is repeated.
     for _ in range(2):
@@ -228,13 +234,62 @@ def test_finish_bonus_is_once_per_episode_and_independent_of_control_dt(modules,
 def test_finish_bonus_is_isolated_across_partial_resets(env):
     env.episode_length_buf[:] = 499  # first finish at 10 seconds
     advance(env, [[50, 0], [1, 0], [1, 0], [1, 0]])
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([30.0, 0, 0, 0]))
+    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([finish_bonus(env, 10), 0, 0, 0]))
     env._reset_idx(torch.tensor([0]))
     assert env._race_terminal_paid.tolist() == [False] * 4
     advance(env, [[1, 0], [50, 0], [1, 0], [1, 0]], steps=500)
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([0, 15.0, 0, 0]))
+    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([0, finish_bonus(env, 20), 0, 0]))
     env._get_rewards()
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([0, 15.0, 0, 0]))
+    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([0, finish_bonus(env, 20), 0, 0]))
+
+
+@pytest.mark.parametrize("width", [2.0, 3.0, 4.0])
+@pytest.mark.parametrize("side", [-1, 1])
+@pytest.mark.parametrize("outside,eligible", [(-0.001, True), (0.0, True), (0.001, False)])
+def test_finish_bonus_central_sixty_percent_boundary(modules, width, side, outside, eligible):
+    env = make_env(modules, num_envs=1, terrain_mode="race")
+    env._race_widths[:] = width
+    env.episode_length_buf[:] = 499
+    y = side * (0.3 * env._race_widths + outside)
+    advance(env, torch.stack((env._race_lengths, y), dim=1))
+    assert env._race_finished.item() and env.reset_terminated.item()
+    expected = finish_bonus(env, 10) if eligible else 0
+    assert env._episode_sums["finish_bonus"].item() == pytest.approx(expected)
+    # Outside the bonus zone still ends the episode; moving inward afterward cannot collect a bonus.
+    advance(env, [env._race_lengths.item() + 1, 0])
+    assert env._episode_sums["finish_bonus"].item() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("side", [-1, 1])
+@pytest.mark.parametrize("previous_fraction,current_fraction,eligible", [(0, 0.4, True), (0.8, 0, False)])
+def test_finish_bonus_uses_interpolated_crossing_not_final_position(
+    modules, side, previous_fraction, current_fraction, eligible
+):
+    env = make_env(modules, num_envs=1, terrain_mode="race")
+    env._race_widths[:] = 3
+    env.episode_length_buf[:] = 499
+    env._race_previous_xy[:] = torch.tensor([[49, side * previous_fraction * 3]])
+    advance(env, [51, side * current_fraction * 3])
+    assert env._race_finished.item()
+    assert env._episode_sums["finish_bonus"].item() == pytest.approx(finish_bonus(env, 10) if eligible else 0)
+
+
+def test_finish_bonus_uses_each_lane_center_width_and_length(env):
+    env._race_lengths[:] = torch.tensor([20, 30, 40, 50])
+    env._race_widths[:] = torch.tensor([2, 3, 4, 5])
+    env._race_track_origins[:] = torch.tensor([[128, 128], [-128, -128], [256, -256], [-256, 256]])
+    # The reset reference line can differ from the lane center and must not define the bonus zone.
+    env._reset_line_start_pos[:] = env._race_track_origins + torch.tensor([0, 0.5])
+    env._race_previous_xy[:, 0] = env._race_lengths - 1
+    env._race_previous_xy[:, 1] = env._race_widths * torch.tensor([0.25, 0.35, -0.25, -0.35])
+    env.episode_length_buf[:] = 499
+    xy = env._race_previous_xy.clone()
+    xy[:, 0] = env._race_lengths
+    advance(env, xy)
+    assert env._race_finished.all() and env.reset_terminated.all()
+    torch.testing.assert_close(
+        env._episode_sums["finish_bonus"], torch.tensor([finish_bonus(env, 10), 0, finish_bonus(env, 10), 0])
+    )
 
 
 @pytest.mark.parametrize("stage1", [False, True])
@@ -323,7 +378,9 @@ def test_unsafe_crossing_terminates_and_reset_starts_new_episode(env):
         env._episode_sums["termination"],
         torch.tensor([1, 1, 1, 0]) * env.cfg.rewards.race_weights["termination"] * env.step_dt,
     )
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([0, 0, 0, 300 / env.step_dt]))
+    torch.testing.assert_close(
+        env._episode_sums["finish_bonus"], torch.tensor([0, 0, 0, finish_bonus(env, env.step_dt)])
+    )
     env._reset_idx(None)
     records = env.extras["race_episode"]
     assert records["success"].tolist() == [False, False, False, True]
@@ -371,7 +428,7 @@ def test_fence_collision_beats_finish_and_timeout_and_logs_collision(env):
     assert env.reset_terminated.tolist() == [True, True, False, False]
     assert env.reset_time_outs.tolist() == [False, False, True, True]
     assert env._race_finished.tolist() == [True, False, False, False]
-    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([10.0, 0, 0, 0]))
+    torch.testing.assert_close(env._episode_sums["finish_bonus"], torch.tensor([finish_bonus(env, 30), 0, 0, 0]))
     assert env._episode_sums["termination"][1] == pytest.approx(
         env.cfg.rewards.race_weights["termination"] * env.step_dt
     )
