@@ -139,9 +139,9 @@ class HumanoidGaitRlEnvCfg(DirectRLEnvCfg):
 
     # commands
     resampling_command_time = 10.0  # [s]
-    lin_vel_x_range = (1.5, 3.0)  # [m/s]
+    lin_vel_x_range = (5.0, 8.0)  # [m/s]
     heading_control_stiffness = 0.5
-    play_lin_vel_x = 2.0  # [m/s], fixed forward command in play mode
+    play_lin_vel_x = 8.0  # [m/s], fixed forward command in play mode
     is_play = False
 
     # reset: random root pose offset around the env origin

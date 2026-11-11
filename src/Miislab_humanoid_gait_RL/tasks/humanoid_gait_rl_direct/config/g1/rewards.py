@@ -34,7 +34,7 @@ class RewardsCfg:
     # 權重為正表示鼓勵該行為，為負表示懲罰該行為，設為 0 則停用該項
     termination = -200.0  # 懲罰非預期終止
     track_lin_vel_xy_exp = 2.0  # 鼓勵追蹤平面線速度指令
-    track_ang_vel_z_exp = 2.0  # 鼓勵追蹤繞垂直軸的角速度指令
+    track_ang_vel_z_exp = 3.0  # 加強追蹤轉向指令，降低行進方向漂移
     ang_vel_xy_l2 = -0.05  # 懲罰機身在水平軸上的角速度
     flat_orientation_l2 = -1.0  # 懲罰機身偏離水平姿態
     dof_torques_l2 = -0.5e-7  # 懲罰腿部關節施力過大
@@ -42,21 +42,22 @@ class RewardsCfg:
     action_rate_l2 = -0.005  # 懲罰相鄰控制步驟的動作變化過大
     dof_pos_limits = -1.0  # 懲罰踝關節超出軟性位置限制
     joint_deviation_hip = -0.01  # 懲罰髖關節偏離預設姿勢
-    joint_deviation_arms = -0.1  # 懲罰手臂關節偏離預設姿勢
+    joint_deviation_arms = -0.01  # 放寬手臂姿勢限制，讓手臂可自然擺動
     joint_deviation_fingers = -0.05  # 懲罰手指關節偏離預設姿勢
     joint_deviation_torso = -0.1  # 懲罰軀幹關節偏離預設姿勢
     feet_air_time = 0.4  # 鼓勵單腳支撐時維持適當時間
     feet_slide = -0.1  # 懲罰腳掌接觸地面時滑動
-    feet_lift = 0.3  # 鼓勵離地且抬高超過目標高度
-    feet_contact_rhythm = 0.5  # 鼓勵目前觸地時間接近上次觸地時間
+    feet_lift = 0.05  # 保留足部離地訊號，但避免過度鼓勵高抬腳與跳躍
+    feet_contact_rhythm = 1.0  # 加強規律步頻
     feet_force_symmetry = 0.15  # 鼓勵雙腳支撐時左右受力對稱
 
     # term parameters
     tracking_std = 0.5  # velocity error at which the tracking rewards drop to exp(-1)
+    tracking_yaw_std = 1.5  # 放寬轉向誤差的有效範圍，提供較穩定的學習訊號
     feet_air_time_max = 0.4  # [s], single-stance time rewarded per step
     feet_lift_target_height = 0.12  # [m], foot height above the terrain origin required for a lift reward
-    feet_contact_rhythm_min_time = 0.1  # [s], ignore short contacts and taps
-    feet_contact_rhythm_std = 0.05  # [s], contact-time difference at which the reward drops to exp(-1)
+    feet_contact_rhythm_min_time = 0.05  # [s], ignore very short contacts and taps
+    feet_contact_rhythm_std = 0.1  # [s], contact-time difference at which the reward drops to exp(-1)
     feet_contact_force_threshold = 30.0  # [N], a foot pushing harder than this counts as touching the ground
     feet_force_symmetry_std = 0.25  # relative force imbalance at which the symmetry reward drops to exp(-1)
     feet_force_symmetry_max_total_contact_time = 0.25  # [s], max combined foot contact duration
@@ -149,7 +150,7 @@ def compute_rewards(env: HumanoidGaitRlEnv, cfg: RewardsCfg) -> dict[str, torch.
     return {
         "termination": env.reset_terminated.float(),
         "track_lin_vel_xy_exp": torch.exp(-lin_vel_error / cfg.tracking_std**2),
-        "track_ang_vel_z_exp": torch.exp(-yaw_rate_error / cfg.tracking_std**2),
+        "track_ang_vel_z_exp": torch.exp(-yaw_rate_error / cfg.tracking_yaw_std**2),
         "ang_vel_xy_l2": ang_vel_xy,
         "flat_orientation_l2": flat_orientation,
         "dof_torques_l2": joint_torques,
