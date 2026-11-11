@@ -31,8 +31,12 @@ class RaceLifecycleMixin:
         self._race_reset_counts = np.zeros(self.num_envs, dtype=np.int64)
         self._race_initial_y = torch.zeros(self.num_envs, device=self.device)
         self._race_initial_yaw = torch.zeros_like(self._race_initial_y)
-        for name in ("finished", "fell", "fence", "terminal_paid", "ever_fell", "ever_fence"):
+        for name in ("finished", "fell", "fence", "terminal_paid", "ever_fell", "ever_fence", "play_counted"):
             setattr(self, "_race_" + name, torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+        self._race_play_episodes = 0
+        self._race_play_successes = 0
+        self._race_play_finish_seconds = 0.0
+        self._race_play_reported = False
         self._race_fall_causes = {
             name: torch.zeros_like(self._race_finished) for name in ("torso_contact", "excessive_tilt", "low_height")
         }
@@ -72,7 +76,7 @@ class RaceLifecycleMixin:
         x, y, z, w = quat.unbind(dim=1)
         self._race_initial_yaw[env_ids] = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y.square() + z.square()))
         self._target_heading[env_ids] = 0.0
-        for name in ("finished", "fell", "fence", "terminal_paid", "ever_fell", "ever_fence"):
+        for name in ("finished", "fell", "fence", "terminal_paid", "ever_fell", "ever_fence", "play_counted"):
             getattr(self, "_race_" + name)[env_ids] = False
         for value in (*self._race_fall_causes.values(), *self._race_sums.values(), self._race_max_lateral):
             value[env_ids] = 0
@@ -93,7 +97,7 @@ class RaceLifecycleMixin:
         return (forces.norm(dim=-1) > threshold).flatten(1).any(dim=1)
 
     def _race_get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Terminate on a fall or fence collision; either failure takes precedence over finishing."""
+        """In play, allow recovery from accidents; training still terminates on either accident."""
         torso = self._filtered_contact(self._torso_ground_sensor, self.cfg.torso_contact_threshold, "ground")
         fence = self._filtered_contact(
             self._fence_contact_sensor, self.cfg.rewards.race_fence_contact_force_threshold, "fence"
@@ -116,7 +120,9 @@ class RaceLifecycleMixin:
         crossed &= crossing_y.abs() <= self._race_widths / 2
         crossed &= ~self._race_fell & ~fence & (self.episode_length_buf <= self.max_episode_length)
         self._race_finished |= crossed
-        terminated = self._race_finished | self._race_fell | self._race_fence
+        terminated = self._race_finished.clone()
+        if not self.cfg.is_play:
+            terminated |= self._race_fell | self._race_fence
         truncated = (self.episode_length_buf >= self.max_episode_length) & ~terminated
         return terminated, truncated
 
@@ -138,12 +144,49 @@ class RaceLifecycleMixin:
             self._race_sums[key] += value * active
         self._race_max_lateral[:] = torch.maximum(self._race_max_lateral, lateral * active)
         self._race_previous_xy[:] = self._race_position()
-        self._race_terminal_paid |= self._race_finished | self._race_fell | self._race_fence
+        if self.cfg.is_play:
+            ended = self._race_finished | self.reset_time_outs
+            new = ended & ~self._race_play_counted & (self.episode_length_buf > 0)
+            if new.any():
+                successes = new & self._race_finished
+                self._race_play_episodes += int(new.sum().item())
+                self._race_play_successes += int(successes.sum().item())
+                self._race_play_finish_seconds += float(
+                    (self.episode_length_buf[successes].double() * self.step_dt).sum().item()
+                )
+                self._race_play_counted |= new
+            self._race_terminal_paid |= ended
+        else:
+            self._race_terminal_paid |= self._race_finished | self._race_fell | self._race_fence
+
+    def close(self) -> None:
+        """Official playback closes the environment on Ctrl+C; print before simulator teardown."""
+        try:
+            if getattr(self, "_race_play_reported", True) is False and self._race_mode and self.cfg.is_play:
+                self._race_play_reported = True
+                episodes, successes = self._race_play_episodes, self._race_play_successes
+                rate = f"{100 * successes / episodes:.2f}%" if episodes else "N/A (no completed episodes)"
+                seconds = (
+                    f"{self._race_play_finish_seconds / successes:.3f} s"
+                    if successes
+                    else "N/A (no successful finishes)"
+                )
+                print(
+                    f"\n[Race play summary]\n"
+                    f"Completed episodes: {episodes}; successful finishes: {successes}\n"
+                    f"Average finish success rate: {rate}\n"
+                    f"Average successful finish time: {seconds}\n"
+                    "Unfinished episodes at shutdown are excluded.",
+                    flush=True,
+                )
+        finally:
+            super().close()
 
     def _race_episode_logs(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-        completed = (self._race_finished | self._race_fell | self._race_fence | self.reset_time_outs) & (
-            self.episode_length_buf > 0
-        )
+        completed = self._race_finished | self.reset_time_outs
+        if not self.cfg.is_play:
+            completed |= self._race_fell | self._race_fence
+        completed &= self.episode_length_buf > 0
         ids = env_ids[completed[env_ids]]
         if len(ids) == 0:
             return {}
